@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scout import analyze, config, pipeline, store, verify
+from scout import alcatrax_knowledge as brain, analyze, config, pipeline, store, verify
 from scout.extract import profile_from_observations
 from scout.models import BusinessProfile, PageSnapshot, SourceFact, SourceObservation
 from scout.providers.base import BrowserProvider, FetchResult, LLMProvider, LLMToolResult, SearchHit, SearchProvider
@@ -42,6 +42,7 @@ def opportunity_item(**changes):
         "evidence_url": "https://two", "evidence_excerpt": "We sell brake pads.",
         "business_consequence": "Customers need product information.",
         "opportunity": "Create a catalogue.", "alcatrax_capability": "catalogue",
+        "problem_tags": ["no_catalogue"], "solution_pattern": "automotive_digital_catalogue",
         "reference_project": "Lucky Line Autospares", "severity": "medium", "confidence": "observed",
     }
     item.update(changes)
@@ -118,6 +119,92 @@ class OpportunityAttributionTests(unittest.TestCase):
                                    OpportunityLLM(opportunity_item()))
         self.assertEqual("catalogue", findings[0].alcatrax_capability)
         self.assertEqual("Lucky Line Autospares", findings[0].reference_project)
+
+    def test_valid_but_irrelevant_project_is_stripped(self):
+        findings = analyze.analyze("candidate", [snapshot("https://two", "We sell brake pads.")], profile(),
+                                   OpportunityLLM(opportunity_item(reference_project="Magda Auto Hub")))
+        self.assertEqual("", findings[0].reference_project)
+
+    def test_invented_solution_pattern_is_rejected(self):
+        findings = analyze.analyze("candidate", [snapshot("https://two", "We sell brake pads.")], profile(),
+                                   OpportunityLLM(opportunity_item(solution_pattern="invented-pattern")))
+        self.assertEqual("", findings[0].solution_pattern)
+        self.assertEqual("", findings[0].reference_project)
+
+    def test_valid_pattern_and_capability_need_no_project(self):
+        findings = analyze.analyze("candidate", [snapshot("https://two", "We sell brake pads.")], profile(),
+                                   OpportunityLLM(opportunity_item(reference_project="")))
+        self.assertEqual("automotive_digital_catalogue", findings[0].solution_pattern)
+        self.assertEqual("catalogue", findings[0].alcatrax_capability)
+        self.assertEqual("", findings[0].reference_project)
+
+    def test_automotive_catalogue_observation_maps_to_pattern(self):
+        auto_profile = BusinessProfile("candidate", "Acme", "automotive spare parts", "drivers", "Nairobi", [], False,
+                                       ["https://one"], "")
+        auto_snapshot = PageSnapshot("https://one", "now", 200, "Acme", "Automotive spare parts available.",
+                                     {"has_viewport_tag": True, "meta_description": "present",
+                                      "has_whatsapp_link": True, "has_ecommerce_words": False})
+        findings = analyze.analyze("candidate", [auto_snapshot], auto_profile, OpportunityLLM({"opportunities": []}))
+        finding = next(f for f in findings if f.category == "ecommerce")
+        self.assertEqual("automotive_digital_catalogue", finding.solution_pattern)
+        self.assertEqual("catalogue", finding.alcatrax_capability)
+        self.assertTrue(finding.reference_project)
+
+    def test_unrelated_problem_is_not_forced_into_automotive_pattern(self):
+        non_auto = BusinessProfile("candidate", "Studio", "interior design services", "home owners", "Nairobi", [], False,
+                                   ["https://one"], "")
+        source = PageSnapshot("https://one", "now", 200, "Studio", "Interior design services.",
+                              {"has_viewport_tag": True, "meta_description": "present",
+                               "has_whatsapp_link": True, "has_ecommerce_words": False})
+        findings = analyze.analyze("candidate", [source], non_auto, OpportunityLLM({"opportunities": []}))
+        finding = next(f for f in findings if f.category == "ecommerce")
+        self.assertEqual("", finding.solution_pattern)
+        self.assertEqual("", finding.reference_project)
+
+
+class KnowledgeGraphTests(unittest.TestCase):
+    def test_known_and_invented_capabilities(self):
+        self.assertTrue(brain.capability_exists("catalogue"))
+        self.assertFalse(brain.capability_exists("invented"))
+
+    def test_known_and_invented_projects(self):
+        self.assertTrue(brain.project_exists("lucky-line"))
+        self.assertFalse(brain.project_exists("invented-project"))
+
+    def test_known_and_invented_patterns(self):
+        self.assertTrue(brain.pattern_exists("automotive_digital_catalogue"))
+        self.assertFalse(brain.pattern_exists("invented-pattern"))
+
+    def test_supported_and_unsupported_pattern_capability(self):
+        self.assertTrue(brain.pattern_includes_capability("automotive_digital_catalogue", "catalogue"))
+        self.assertFalse(brain.pattern_includes_capability("automotive_digital_catalogue", "booking"))
+
+    def test_supported_and_unsupported_project_capability(self):
+        self.assertTrue(brain.project_demonstrates_capability("lucky-line", "catalogue"))
+        self.assertFalse(brain.project_demonstrates_capability("lucky-line", "booking"))
+
+    def test_supported_and_unsupported_project_pattern(self):
+        self.assertTrue(brain.project_supports_pattern("lucky-line", "automotive_digital_catalogue"))
+        self.assertFalse(brain.project_supports_pattern("magda-auto-hub", "automotive_digital_catalogue"))
+
+    def test_catalogue_integrity(self):
+        self.assertEqual([], brain.catalogue_integrity_errors())
+
+    def test_integrity_rejects_bad_project_references_and_duplicates(self):
+        bad_project = brain.PastProject("lucky-line", "Duplicate", capabilities_used=["missing-capability"],
+                                        solution_pattern_ids=["missing-pattern"])
+        with patch.object(brain, "PAST_PROJECTS", brain.PAST_PROJECTS + [bad_project]):
+            errors = brain.catalogue_integrity_errors()
+        self.assertTrue(any("duplicate project IDs" in error for error in errors))
+        self.assertTrue(any("unknown capability" in error for error in errors))
+        self.assertTrue(any("unknown pattern" in error for error in errors))
+
+    def test_integrity_rejects_bad_pattern_references(self):
+        bad_pattern = brain.SolutionPattern("bad-pattern", "Bad", "", [], ["missing-capability"], ["missing-project"])
+        with patch.object(brain, "SOLUTION_PATTERNS", brain.SOLUTION_PATTERNS + [bad_pattern]):
+            errors = brain.catalogue_integrity_errors()
+        self.assertTrue(any("unknown capability" in error for error in errors))
+        self.assertTrue(any("unknown project" in error for error in errors))
 
 
 class FakeSearch(SearchProvider):

@@ -63,10 +63,13 @@ def to_markdown(brief: ProspectBrief) -> str:
             lines.append(f"- **Evidence excerpt:** {o.evidence_excerpt}")
         lines.append(f"- **Business consequence:** {o.business_consequence}")
         lines.append(f"- **Opportunity:** {o.opportunity}")
+        if o.solution_pattern:
+            lines.append(f"- **Alcatrax solution pattern:** {o.solution_pattern}")
         if o.alcatrax_capability:
-            lines.append(f"- **Alcatrax capability:** {o.alcatrax_capability}")
+            lines.append(f"- **Alcatrax capabilities:** {o.alcatrax_capability}")
         if o.reference_project:
-            lines.append(f"- **Reference project:** {o.reference_project}")
+            lines.append(f"- **Relevant Alcatrax work:** {o.reference_project}")
+        lines.append(f"- **Confidence:** {o.confidence}")
         lines.append("")
     lines += ["## Evidence sources", *[f"- {u}" for u in brief.evidence_urls]]
     return "\n".join(lines)

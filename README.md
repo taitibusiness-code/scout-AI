@@ -28,6 +28,35 @@ fact; `INFERRED` is an analysis without a validated direct excerpt; `UNKNOWN`
 means insufficient evidence. Conflicts remain visible and are never marked
 verified. Source observations are persisted to SQLite for later dossier audit.
 
+## Alcatrax Knowledge Brain
+
+The curated catalogue in `scout/alcatrax_knowledge.py` separates four things:
+
+- **Capability** — a service Alcatrax can offer, with a proof state:
+  `proven` (recorded client evidence), `demonstrated` (credible internal or
+  public demonstration), or `developing` (catalogued direction without a
+  recorded client deployment).
+- **Solution pattern** — a reusable solution shape, such as an automotive
+  digital catalogue. It names the business-problem tags, capabilities, and
+  projects that actually support that pattern.
+- **Past project** — a factual reference record. It is proof only for its
+  explicitly recorded capabilities and solution patterns, not a generic
+  marketing recommendation.
+- **Opportunity** — a source-attributed observation and consequence that may
+  match a pattern, capability, and relevant project.
+
+The matching chain is:
+
+```text
+Evidence → problem tags → solution pattern → capability → relevant project
+```
+
+Application code validates every relationship. A known capability plus a
+known project is still rejected as a reference when that project does not
+demonstrate the capability or support the selected pattern. Scout may retain
+a valid pattern/capability without a project reference when no honest proof
+record exists.
+
 ## Pipeline
 
 ```
@@ -68,7 +97,7 @@ persisted to `scout.db` (SQLite) and every action logged to
 | `browse.py` | Browse | `requests` + BeautifulSoup. Will miss JS-rendered content — swap for Playwright when you hit that wall; `PageSnapshot` contract doesn't change. |
 | `extract.py` | Understand | Extracts each source separately and requires evidence excerpts for direct claims. |
 | `verify.py` | Verify | Requires two independently extracted URLs before a fact is verified. |
-| `analyze.py` | Analyze | Deterministic checks (viewport tag, meta description, WhatsApp link, cart keywords) run first — zero hallucination risk — then one LLM pass for judgment calls the heuristics can't make. Capped at 8 findings. |
+| `analyze.py` | Analyze | Validates evidence excerpts and the problem → pattern → capability → project graph; deterministic automotive catalogue matching is intentionally narrow. |
 | `brief.py` | Recommend | Assembles everything into a `ProspectBrief`, renders Markdown. |
 | `store.py` | Remember | Plain SQLite, including durable bounded source observations/evidence. |
 | `logging_utils.py` | (all steps) | One JSON line per action, in `scout_log.jsonl`. |
@@ -113,8 +142,7 @@ behind it.
   conflict, and unknown cases
 - SQLite source-observation persistence and source-attributed opportunities
 - Full fake-provider pipeline producing a persisted brief
-- Guard rail: a fabricated capability id / fake reference project from the
-  LLM gets stripped to empty string, never trusted into the brief
+- Knowledge-graph guards for invented IDs and invalid pattern/capability/project relationships
 
 Run them with:
 
@@ -129,12 +157,9 @@ python3 -m unittest discover -s tests -v
 - `action_registry.py` — nothing calls `.propose()` yet since Scout has no
   write/external actions in this phase; it's here so Developer/Sales don't
   each invent their own permission check later
-- `alcatrax_knowledge.py`'s `PAST_PROJECTS` list only has the 5 projects
-  publicly listed on the Alcatrax site — add Karani's EC & BV Motors, Weru
-  Interiors, and the rest with their real problem/capability mapping as you
-  have that internally; the analyze.py guard rail only allows references to
-  what's actually in this list, so an empty entry here means Scout correctly
-  says nothing rather than inventing a comparison
+- Karani's EC & BV Motors and Weru Interiors are recorded by name, but their
+  industry, delivery, capabilities, and pattern proof remain deliberately
+  unknown until factual project information is supplied.
 
 ## Still open from the Phase 1/2/3 plan (not in this drop)
 

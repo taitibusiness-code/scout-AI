@@ -134,8 +134,8 @@ class VerificationResult:
 @dataclass
 class OpportunityFinding:
     """One opportunity, as a full evidence chain -- not a score.
-    observed -> evidence -> business_consequence -> opportunity -> capability
-    -> reference_project -> confidence
+    observed -> evidence -> problem tags -> business consequence -> opportunity
+    -> solution pattern -> capability -> reference project -> confidence
     """
     category: str                          # e.g. "mobile_ux", "ecommerce", "seo", "whatsapp_flow", "stack"
     observed: str                          # what was actually seen (fact, not judgment)
@@ -143,6 +143,8 @@ class OpportunityFinding:
     business_consequence: str              # why this costs the business something
     opportunity: str                       # the concrete thing Alcatrax could build
     evidence_excerpt: str = ""            # durable source excerpt / metadata observation
+    problem_tags: list[str] = field(default_factory=list)
+    solution_pattern: str = ""             # SolutionPattern id from alcatrax_knowledge
     alcatrax_capability: str = ""          # capability id from alcatrax_knowledge.CAPABILITIES
     reference_project: str = ""            # past project id/name this resembles, if any
     severity: str = "medium"               # "low" | "medium" | "high"

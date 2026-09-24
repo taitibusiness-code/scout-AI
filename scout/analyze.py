@@ -36,6 +36,10 @@ OPPORTUNITIES_TOOL = {
                         "evidence_excerpt": {"type": "string", "description": "Short verbatim excerpt from evidence_url supporting observed."},
                         "business_consequence": {"type": "string", "description": "Why this costs the business something concrete."},
                         "opportunity": {"type": "string", "description": "The specific thing Alcatrax could build."},
+                        "problem_tags": {"type": "array", "items": {"type": "string"},
+                                         "description": "Curated problem tags supported by the evidence, if known."},
+                        "solution_pattern": {"type": "string",
+                                             "description": "A listed Alcatrax solution-pattern ID, or empty string."},
                         "alcatrax_capability": {
                             "type": "string",
                             "description": "Must be a capability id from the ALCATRAX CAPABILITIES list given to you, or empty string.",
@@ -71,6 +75,36 @@ SYSTEM_PROMPT_TEMPLATE = (
     "must identify an exact supplied URL and a short verbatim excerpt that supports its observed field.\n\n"
     "{knowledge}"
 )
+
+
+def _validated_links(problem_tags: list[str], pattern_id: str, capability_id: str,
+                     project_identifier: str) -> tuple[str, str, str]:
+    """Keep only graph relationships explicitly present in the knowledge brain."""
+    pattern = pattern_id if brain.pattern_exists(pattern_id) else ""
+    capability = capability_id if brain.capability_exists(capability_id) else ""
+    project = brain.project_by_identifier(project_identifier) if project_identifier else None
+
+    if pattern and (not problem_tags or not any(tag in brain.pattern_by_id(pattern).problem_tags for tag in problem_tags)):
+        pattern = ""
+    if pattern and capability and not brain.pattern_includes_capability(pattern, capability):
+        capability = ""
+    if project:
+        if not pattern or not brain.project_supports_pattern(project.id, pattern):
+            project = None
+        elif capability and not brain.project_demonstrates_capability(project.id, capability):
+            project = None
+    return pattern, capability, project.client_name if project else ""
+
+
+def _automotive_catalogue_links(profile: BusinessProfile, snapshot: PageSnapshot) -> tuple[list[str], str, str, str]:
+    text = " ".join([profile.what_they_sell, snapshot.text_content]).lower()
+    automotive_terms = ("spare part", "auto part", "automotive", "vehicle", "motor", "4x4")
+    if not any(term in text for term in automotive_terms):
+        return [], "", "catalogue", ""
+    tags = ["no_catalogue", "poor_product_discovery"]
+    projects = brain.projects_for_pattern("automotive_digital_catalogue")
+    reference = projects[0].client_name if projects else ""
+    return tags, *_validated_links(tags, "automotive_digital_catalogue", "catalogue", reference)
 
 
 def analyze(candidate_id: str, snapshots: list[PageSnapshot], profile: BusinessProfile,
@@ -116,6 +150,7 @@ def analyze(candidate_id: str, snapshots: list[PageSnapshot], profile: BusinessP
                 severity="medium", confidence="observed",
             ))
         if profile.has_ecommerce is False and s.html_meta.get("has_ecommerce_words") is False:
+            problem_tags, pattern, capability, reference = _automotive_catalogue_links(profile, s)
             findings.append(OpportunityFinding(
                 category="ecommerce",
                 observed="No catalogue or online ordering/checkout flow detected.",
@@ -123,7 +158,10 @@ def analyze(candidate_id: str, snapshots: list[PageSnapshot], profile: BusinessP
                 evidence_excerpt="HTML/page-text heuristic: no ecommerce keywords detected.",
                 business_consequence="Customers must contact manually to discover stock or prices.",
                 opportunity="Searchable digital catalogue or full ecommerce flow.",
-                alcatrax_capability="catalogue",
+                problem_tags=problem_tags,
+                solution_pattern=pattern,
+                alcatrax_capability=capability,
+                reference_project=reference,
                 severity="high", confidence="observed",
             ))
 
@@ -141,8 +179,6 @@ def analyze(candidate_id: str, snapshots: list[PageSnapshot], profile: BusinessP
             input_schema=OPPORTUNITIES_TOOL["input_schema"],
             max_tokens=1200,
         )
-        valid_capability_ids = {c.id for c in brain.CAPABILITIES}
-        valid_project_names = {p.client_name for p in brain.PAST_PROJECTS}
         valid_categories = {"mobile_ux", "ecommerce", "seo", "whatsapp_flow", "stack", "trust_signals", "other"}
         valid_severities = {"low", "medium", "high"}
         valid_confidences = {"observed", "verified", "inferred", "unknown"}
@@ -167,16 +203,14 @@ def analyze(candidate_id: str, snapshots: list[PageSnapshot], profile: BusinessP
             if not supported(item["evidence_url"], item["evidence_excerpt"]):
                 # An LLM statement without a traceable source is not an observed opportunity.
                 continue
-            # Guard rail: if the model names a capability/project that isn't
-            # actually in the catalogue, drop the reference rather than trust
-            # it -- this is exactly the "never invent a capability" rule from
-            # the prompt, enforced in code, not just requested in the prompt.
-            cap = item.get("alcatrax_capability", "")
-            if cap not in valid_capability_ids:
-                cap = ""
-            ref = item.get("reference_project", "")
-            if ref not in valid_project_names:
-                ref = ""
+            raw_tags = item.get("problem_tags", [])
+            raw_pattern = item.get("solution_pattern", "")
+            if (not isinstance(raw_tags, list) or not all(isinstance(tag, str) for tag in raw_tags)
+                    or not isinstance(raw_pattern, str)):
+                continue
+            problem_tags = list(dict.fromkeys(raw_tags))
+            pattern, cap, ref = _validated_links(problem_tags, raw_pattern,
+                                                  item["alcatrax_capability"], item["reference_project"])
 
             findings.append(OpportunityFinding(
                 category=item["category"],
@@ -185,6 +219,8 @@ def analyze(candidate_id: str, snapshots: list[PageSnapshot], profile: BusinessP
                 evidence_excerpt=item["evidence_excerpt"][:600],
                 business_consequence=item["business_consequence"],
                 opportunity=item["opportunity"],
+                problem_tags=problem_tags,
+                solution_pattern=pattern,
                 alcatrax_capability=cap,
                 reference_project=ref,
                 severity=item["severity"],
