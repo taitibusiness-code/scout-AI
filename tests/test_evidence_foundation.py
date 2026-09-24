@@ -243,6 +243,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual([], result.failures)
             dossier = store.load_dossier(str(Path(directory) / "scout.db"), result.briefs[0]["brief"].candidate_id)
             self.assertEqual(1, len(dossier["source_observations"]))
+            self.assertTrue(result.briefs[0]["brief"].entity_id)
 
     def test_non_llm_config_does_not_require_anthropic_key(self):
         with patch.dict(os.environ, {}, clear=True):

@@ -30,9 +30,11 @@ class PipelineRunResult:
 
 def run(query: str, search: SearchProvider, browser: BrowserProvider, llm: LLMProvider,
         db_path: str, log_path: str, max_candidates: int = 10,
-        extra_sources_per_candidate: list[str] | None = None) -> PipelineRunResult:
+        extra_sources_per_candidate: list[str] | None = None, entity_type: str = "prospect",
+        industry: str = "") -> PipelineRunResult:
     log = ActionLog(log_path)
     outcome = PipelineRunResult()
+    store.validate_entity_type(entity_type)
 
     # DISCOVER
     candidates = discover.discover_search(query, search, max_candidates)
@@ -56,6 +58,15 @@ def run(query: str, search: SearchProvider, browser: BrowserProvider, llm: LLMPr
             profile = extract.profile_from_observations(candidate.id, observations)
             store.save_profile(db_path, profile)
             log.log("understand", candidate.id, "extracted", {"business_name": profile.business_name})
+
+            # Resolve only after source-specific extraction supplies a factual
+            # location/name. Candidates remain individual discovery occurrences.
+            entity = store.resolve_entity(
+                db_path, profile.business_name or candidate.name, candidate.source_url,
+                profile.location, entity_type=entity_type, industry=industry,
+            )
+            store.link_candidate_to_entity(db_path, candidate, entity.id)
+            log.log("resolve_entity", candidate.id, "linked", {"entity_id": entity.id, "entity_type": entity.entity_type})
 
             # VERIFY (pass extra_sources_per_candidate to get real cross-source
             # verification -- with one source, facts cap out at 'observed')

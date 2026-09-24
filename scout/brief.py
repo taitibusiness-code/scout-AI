@@ -20,6 +20,7 @@ def build_brief(candidate: Candidate, profile: BusinessProfile,
     )
     return ProspectBrief(
         candidate_id=candidate.id,
+        entity_id=candidate.entity_id,
         business_name=profile.business_name or candidate.name,
         summary=summary,
         opportunities=opportunities,

@@ -18,6 +18,22 @@ def _uid() -> str:
     return uuid.uuid4().hex[:12]
 
 
+ENTITY_TYPES = ("prospect", "competitor", "industry_reference")
+
+
+@dataclass
+class Entity:
+    """Canonical organization identity; many discovery candidates may link here."""
+    id: str = field(default_factory=_uid)
+    canonical_name: str = ""
+    entity_type: str = "prospect"
+    primary_domain: str = ""
+    industry: str = ""
+    location: str = ""
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+
+
 @dataclass
 class Candidate:
     """Output of the DISCOVER step: a raw lead before anything is verified."""
@@ -26,6 +42,7 @@ class Candidate:
     source: str = ""          # e.g. "google_cse", "manual"
     source_url: str = ""      # the search result URL that pointed at it
     query: str = ""           # the discover query that produced this
+    entity_id: str = ""        # canonical Entity id, resolved after profile extraction
     discovered_at: str = field(default_factory=_now)
 
 
@@ -160,6 +177,7 @@ class ProspectBrief:
     """Output of the RECOMMEND step: the deliverable Dennis actually reads."""
     id: str = field(default_factory=_uid)
     candidate_id: str = ""
+    entity_id: str = ""
     business_name: str = ""
     summary: str = ""
     opportunities: list[OpportunityFinding] = field(default_factory=list)

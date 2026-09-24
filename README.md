@@ -57,6 +57,35 @@ demonstrate the capability or support the selected pattern. Scout may retain
 a valid pattern/capability without a project reference when no honest proof
 record exists.
 
+## Canonical entities and stored-sample intelligence
+
+A **Candidate** is one discovery occurrence. An **Entity** is the canonical
+business or organization that candidates can share. Scout resolves an entity
+conservatively: normalized domain first (`www.example.com/about` and
+`example.com` match), then exact normalized name plus exact non-empty
+location. It never uses LLM or fuzzy matching for automatic merges; uncertain
+matches remain separate.
+
+Entities have one of three tracking types: `prospect`, `competitor`, or
+`industry_reference`. This is classification only—the same evidence-first
+research pipeline is used for every type.
+
+The deterministic query layer exposes stored-sample reports:
+
+```bash
+python -m scout.cli entities [--type prospect]
+python -m scout.cli industry-report automotive_spare_parts
+python -m scout.cli opportunities
+python -m scout.cli competitors
+python -m scout.cli market-summary
+```
+
+Reports state their scope explicitly: they describe only entities Scout has
+researched and persisted, never an entire industry or market. Opportunity
+ranking is deterministic and explainable: confidence, severity, direct source
+excerpt, capability maturity, solution-pattern match, and relevant project
+proof are fixed components in `intelligence.PRIORITY_WEIGHTS`.
+
 ## Pipeline
 
 ```
@@ -99,7 +128,8 @@ persisted to `scout.db` (SQLite) and every action logged to
 | `verify.py` | Verify | Requires two independently extracted URLs before a fact is verified. |
 | `analyze.py` | Analyze | Validates evidence excerpts and the problem → pattern → capability → project graph; deterministic automotive catalogue matching is intentionally narrow. |
 | `brief.py` | Recommend | Assembles everything into a `ProspectBrief`, renders Markdown. |
-| `store.py` | Remember | Plain SQLite, including durable bounded source observations/evidence. |
+| `store.py` | Remember | SQLite evidence plus canonical entities and candidate-to-entity links. |
+| `intelligence.py` | Aggregate | Deterministic stored-sample industry, competitor, market, and opportunity views. |
 | `logging_utils.py` | (all steps) | One JSON line per action, in `scout_log.jsonl`. |
 | `pipeline.py` | orchestration | Sequential, not parallel. One bad site/candidate never kills the run. |
 
