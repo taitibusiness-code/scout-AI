@@ -1,15 +1,8 @@
 """Local Ollama, wrapped to the LLMProvider interface.
 
-STUB -- not wired into pipeline.py by default. This exists to prove the
-interface is honest (a second real implementation, not just one class
-pretending to be an abstraction) and to give you a concrete starting point
-once you want cheap/local extraction for simple pages, reserving Anthropic
-calls for the harder analyze.py judgment calls.
-
-Ollama's /api/chat does not support forced tool-choice as reliably as
-Anthropic's API -- smaller local models frequently ignore or malform tool
-schemas. Treat this as needing a validate-and-retry loop before it's
-trustworthy for the UNDERSTAND step; don't just swap it in and assume parity.
+Ollama's native JSON format plus disabled thinking are used for the strict
+structured-output contract Scout needs. Prompt schema instructions remain as
+an additional guard; application-level validation still decides acceptance.
 """
 import json
 import requests
@@ -31,7 +24,14 @@ class OllamaLLMProvider(LLMProvider):
         )
         resp = requests.post(
             f"{self.base_url}/api/generate",
-            json={"model": self.model, "prompt": prompt, "stream": False},
+            json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "think": False,
+                "options": {"num_predict": max_tokens},
+            },
             timeout=60,
         )
         resp.raise_for_status()

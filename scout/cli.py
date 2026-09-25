@@ -9,16 +9,19 @@ Usage:
   python -m scout.cli list
   python -m scout.cli watch <brief_id>
 """
+from __future__ import annotations
+
 import argparse
 import json
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from .config import load_config
 from .providers.google_cse import GoogleCSEProvider
 from .providers.requests_browser import RequestsBrowserProvider
-from .providers.anthropic_llm import AnthropicLLMProvider
 from . import intelligence, pipeline, store
 
 
@@ -31,14 +34,29 @@ def _build_providers(cfg):
         raise RuntimeError("GOOGLE_CSE_API_KEY/GOOGLE_CSE_CX not set.")
     search = GoogleCSEProvider(cfg.google_cse_api_key, cfg.google_cse_cx)
     browser = RequestsBrowserProvider()
-    if not cfg.anthropic_api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set.")
-    llm = AnthropicLLMProvider(cfg.anthropic_api_key, cfg.model)
+    if cfg.llm_provider == "ollama":
+        from .providers.ollama_llm import OllamaLLMProvider
+        llm = OllamaLLMProvider(cfg.ollama_model, cfg.ollama_base_url)
+    elif cfg.llm_provider == "anthropic":
+        if not cfg.anthropic_api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+        try:
+            from .providers.anthropic_llm import AnthropicLLMProvider
+        except ModuleNotFoundError as error:
+            if error.name == "anthropic":
+                raise RuntimeError(
+                    "Anthropic SDK is not installed. Install the declared dependency before selecting "
+                    "SCOUT_LLM_PROVIDER=anthropic."
+                ) from error
+            raise
+        llm = AnthropicLLMProvider(cfg.anthropic_api_key, cfg.anthropic_model)
+    else:  # Config validates this; keep the boundary explicit.
+        raise RuntimeError(f"Unsupported LLM provider: {cfg.llm_provider}")
     return search, browser, llm
 
 
 def cmd_discover(args):
-    cfg = load_config()
+    cfg = load_config(require_llm=True)
     search, browser, llm = _build_providers(cfg)
     results = pipeline.run(args.query, search, browser, llm,
                             cfg.db_path, cfg.log_path, max_candidates=args.max,
@@ -96,6 +114,34 @@ def cmd_market_summary(args):
     _print_report(intelligence.market_summary(cfg.db_path))
 
 
+def doctor_report(cfg) -> list[str]:
+    """Diagnostic only; never prints credentials or performs a search."""
+    lines = ["Python: OK", f"Google CSE API key: {'configured' if cfg.google_cse_api_key else 'missing'}",
+             f"Google CSE CX: {'configured' if cfg.google_cse_cx else 'missing'}",
+             f"Selected LLM provider: {cfg.llm_provider}"]
+    if cfg.llm_provider == "ollama":
+        lines.append(f"Ollama endpoint: {cfg.ollama_base_url}")
+        try:
+            with urlopen(f"{cfg.ollama_base_url.rstrip('/')}/api/tags", timeout=3) as response:
+                models = {model.get("name") for model in json.loads(response.read().decode("utf-8")).get("models", [])}
+            lines.append("Ollama endpoint status: reachable")
+            lines.append(f"Ollama model {cfg.ollama_model}: {'available' if cfg.ollama_model in models else 'missing'}")
+        except (URLError, OSError, ValueError, json.JSONDecodeError):
+            lines.append("Ollama endpoint status: unreachable")
+            lines.append(f"Ollama model {cfg.ollama_model}: unknown")
+        lines.append("Anthropic: not required")
+    else:
+        import importlib.util
+        lines.append(f"Anthropic API key: {'configured' if cfg.anthropic_api_key else 'missing'}")
+        lines.append(f"Anthropic SDK: {'available' if importlib.util.find_spec('anthropic') else 'missing'}")
+    return lines
+
+
+def cmd_doctor(args):
+    for line in doctor_report(load_config(require_llm=False)):
+        print(line)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="scout")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -132,6 +178,9 @@ def main():
 
     p_market = sub.add_parser("market-summary", help="Summarize Scout's stored sample")
     p_market.set_defaults(func=cmd_market_summary)
+
+    p_doctor = sub.add_parser("doctor", help="Report local provider readiness without exposing secrets")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()
     args.func(args)

@@ -97,14 +97,39 @@ pages, extracts structured facts, cross-checks them, and writes a brief.
 It never contacts a business, never writes to any external system, and
 never acts on anything without you. This is intentional for v1.
 
-## Setup
+## Provider configuration
+
+Scout is local-first by default:
+
+```text
+Google CSE → RequestsBrowserProvider → Ollama qwen3:8b
+```
+
+The application reads shell environment variables. `.env.example` is a
+placeholder-only reference; Scout does not load `.env` files itself.
+
+Local mode:
 
 ```bash
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...
-export GOOGLE_CSE_API_KEY=...        # from console.cloud.google.com
-export GOOGLE_CSE_CX=...             # from programmablesearchengine.google.com
+export SCOUT_LLM_PROVIDER=ollama
+export SCOUT_OLLAMA_MODEL=qwen3:8b
+export SCOUT_OLLAMA_BASE_URL=http://127.0.0.1:11434
+export GOOGLE_CSE_API_KEY=replace_me
+export GOOGLE_CSE_CX=replace_me
 ```
+
+Optional cloud mode:
+
+```bash
+export SCOUT_LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=replace_me
+export GOOGLE_CSE_API_KEY=replace_me
+export GOOGLE_CSE_CX=replace_me
+```
+
+`discover` requires Google CSE credentials and the selected LLM. Stored-data
+commands and `python -m scout.cli --help` require neither. Run
+`python -m scout.cli doctor` for a secret-safe local readiness report.
 
 ## Run it
 
@@ -181,9 +206,9 @@ python3 -m unittest discover -s tests -v
 ```
 
 **Stub / not yet wired in:**
-- `providers/ollama_llm.py` exists and implements the interface but
-  `pipeline.py`/`cli.py` still default to Anthropic only — swapping requires
-  passing an `OllamaLLMProvider` instance instead in `_build_providers()`
+- `providers/ollama_llm.py` is the default local LLM path. It relies on a
+  JSON-only prompt and has no validate-and-retry loop, so local structured
+  extraction quality should be assessed before relying on it at scale.
 - `action_registry.py` — nothing calls `.propose()` yet since Scout has no
   write/external actions in this phase; it's here so Developer/Sales don't
   each invent their own permission check later
