@@ -19,6 +19,9 @@ def _uid() -> str:
 
 
 ENTITY_TYPES = ("prospect", "competitor", "industry_reference")
+MISSION_STATUSES = ("PENDING", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "STOPPED")
+TASK_STATUSES = ("PENDING", "RUNNING", "COMPLETED", "FAILED", "SKIPPED")
+TASK_TYPES = ("GENERATE_SEARCH", "SEARCH", "INVESTIGATE_ENTITY", "FETCH_PAGE", "RECON_ENTITY", "VERIFY_ENTITY", "EVALUATE_ENTITY", "REVISIT_ENTITY", "BUILD_REPORT")
 
 
 @dataclass
@@ -32,6 +35,54 @@ class Entity:
     location: str = ""
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
+
+
+@dataclass
+class Mission:
+    """Persisted intent and hard safety limits for autonomous public research."""
+    id: str = field(default_factory=_uid)
+    objective: str = ""
+    status: str = "PENDING"
+    geographic_scope: str = ""
+    industries: list[str] = field(default_factory=list)
+    business_types: list[str] = field(default_factory=list)
+    max_entities: int = 50
+    max_searches: int = 20
+    max_pages_per_entity: int = 3
+    max_total_pages: int = 100
+    max_retries: int = 2
+    worker_count: int = 4
+    time_budget_seconds: int | None = None
+    freshness_seconds: int = 60 * 60 * 24 * 30
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+    started_at: str = ""
+    completed_at: str = ""
+    paused_at: str = ""
+    stop_reason: str = ""
+    counters: dict = field(default_factory=dict)
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ResearchTask:
+    """A small, auditable unit of internal research; never an external action."""
+    id: str = field(default_factory=_uid)
+    mission_id: str = ""
+    entity_id: str = ""
+    parent_task_id: str = ""
+    task_type: str = "SEARCH"
+    status: str = "PENDING"
+    priority: int = 50
+    attempts: int = 0
+    max_attempts: int = 2
+    payload: dict = field(default_factory=dict)
+    result_summary: dict = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+    started_at: str = ""
+    completed_at: str = ""
+    error: str = ""
 
 
 @dataclass

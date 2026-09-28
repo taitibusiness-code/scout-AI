@@ -139,6 +139,39 @@ python -m scout.cli list
 python -m scout.cli watch <brief_id>     # mark for periodic re-checking later
 ```
 
+## Mission Engine (Phase 2.4)
+
+The Mission Engine is the bounded option for limited public-web reconnaissance.
+It plans search and page tasks locally, persists each task and evidence version
+to SQLite, and produces an evidence-backed report. It does not contact a
+business or perform any external write.
+
+```bash
+python -m scout.cli mission start --objective "Find local hardware shops" --location Nairobi \
+  --industry retail_local --max-searches 2 --max-entities 5 --max-total-pages 10 \
+  --worker-count 2 --time-budget-seconds 120 --run
+```
+
+`--run` requires Google CSE credentials, but the deterministic Mission Engine
+does not require an LLM. The older LLM-backed `discover` command requires the
+selected Ollama or Anthropic provider; mission planning and reporting do not.
+Worker count is strictly bounded to 1–8;
+searches, entities, pages, retries, freshness, and elapsed time are all
+bounded and shown in the mission report.
+
+Before each live page request Scout permits only public HTTP(S) destinations,
+checks redirects under the same policy, identifies itself with a clear user
+agent, and reads/caches `robots.txt`. If robots policy is unavailable or
+disallows a path, Scout skips it and records the policy skip. It does not
+bypass robots rules. RequestsBrowserProvider is not a JavaScript browser and
+its DNS pre-check cannot fully eliminate DNS-rebinding risk.
+
+Evidence visits are versioned: a revisit retains the previous observation;
+current assessments use the newest visit per URL. The report's **Public
+Business Readiness** / **Digital Presence Signal** is only a public-web
+sales-prioritisation signal. It is not proof of revenue, creditworthiness, or
+financial health.
+
 Output: one Markdown brief per business in `./briefs/`, plus everything
 persisted to `scout.db` (SQLite) and every action logged to
 `scout_log.jsonl`.
@@ -165,8 +198,9 @@ persisted to `scout.db` (SQLite) and every action logged to
    selection design before it can improve verification.
 2. **JS-heavy sites** — swap `browse.fetch` for a Playwright-based version once
    you notice snapshots coming back near-empty for known-real businesses.
-3. **Rate limiting / politeness** — add delays between fetches before running
-   this against a long candidate list; right now it's unthrottled.
+3. **Robots coverage is intentionally conservative** — a robots endpoint that
+   cannot be retrieved causes a skip. This protects sites but can reduce
+   coverage, especially for small or unreliable sites.
 4. **Real discover coverage of Kenyan SMEs** — Google CSE indexes what Google
    indexes. Consider supplementing with a Google Maps Places API discover
    backend (structured business listings, not just indexed pages) once this

@@ -23,10 +23,24 @@ from .config import load_config
 from .providers.google_cse import GoogleCSEProvider
 from .providers.requests_browser import RequestsBrowserProvider
 from . import intelligence, pipeline, store
+from .mission import ScoutMissionEngine
 
 
 def _print_report(report):
     print(json.dumps(report, default=lambda value: asdict(value) if is_dataclass(value) else str(value), indent=2))
+
+
+def _bounded_int(label: str, minimum: int, maximum: int):
+    """Argparse converter that rejects unsafe mission values before creation."""
+    def convert(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer") from error
+        if not minimum <= number <= maximum:
+            raise argparse.ArgumentTypeError(f"{label} must be between {minimum} and {maximum}")
+        return number
+    return convert
 
 
 def _build_providers(cfg):
@@ -142,6 +156,56 @@ def cmd_doctor(args):
         print(line)
 
 
+def _mission_engine(args, live: bool = False):
+    cfg = load_config(require_llm=False)
+    if not live:
+        return ScoutMissionEngine(cfg.db_path)
+    if not (cfg.google_cse_api_key and cfg.google_cse_cx):
+        raise RuntimeError("GOOGLE_CSE_API_KEY/GOOGLE_CSE_CX not set.")
+    # The deterministic Mission Engine does not call an LLM; do not require or
+    # initialize one just to perform bounded public-web research.
+    return ScoutMissionEngine(cfg.db_path, GoogleCSEProvider(cfg.google_cse_api_key, cfg.google_cse_cx), RequestsBrowserProvider())
+
+
+def cmd_mission_start(args):
+    engine = _mission_engine(args, live=False)
+    mission = engine.create(args.objective, args.location, args.industry,
+                            max_entities=args.max_entities, max_searches=args.max_searches,
+                            max_pages_per_entity=args.max_pages_per_entity, max_total_pages=args.max_total_pages,
+                            worker_count=args.worker_count, max_retries=args.max_retries,
+                            freshness_seconds=args.freshness_seconds, time_budget_seconds=args.time_budget_seconds)
+    print(mission.id)
+    if args.run:
+        _mission_engine(args, live=True).run(mission.id)
+
+
+def cmd_mission_resume(args):
+    _mission_engine(args, live=True).run(args.mission_id)
+
+
+def cmd_mission_pause(args):
+    mission = _mission_engine(args).pause(args.mission_id)
+    print(f"{mission.id}: {mission.status}")
+
+
+def cmd_mission_status(args):
+    mission = store.get_mission(load_config(require_llm=False).db_path, args.mission_id)
+    if not mission:
+        raise SystemExit(f"Unknown mission: {args.mission_id}")
+    _print_report(mission)
+
+
+def cmd_mission_report(args):
+    cfg = load_config(require_llm=False)
+    report = store.get_mission_report(cfg.db_path, args.mission_id) or ScoutMissionEngine(cfg.db_path).build_report(args.mission_id)
+    print(report)
+
+
+def cmd_missions(args):
+    for mission in store.list_missions(load_config(require_llm=False).db_path):
+        print(f"[{mission.status:>9}] {mission.id}  {mission.objective}")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="scout")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -181,6 +245,31 @@ def main():
 
     p_doctor = sub.add_parser("doctor", help="Report local provider readiness without exposing secrets")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_missions = sub.add_parser("missions", help="List persisted autonomous research missions")
+    p_missions.set_defaults(func=cmd_missions)
+    p_mission = sub.add_parser("mission", help="Create, run, inspect, or report a research mission")
+    mission_sub = p_mission.add_subparsers(dest="mission_command", required=True)
+    p_start = mission_sub.add_parser("start", help="Create a bounded public-web mission; --run requires Google CSE and respects robots.txt")
+    p_start.add_argument("--objective", required=True); p_start.add_argument("--location", default="")
+    p_start.add_argument("--industry", action="append", choices=("automotive", "hospitality", "health_fitness", "education_professional", "retail_local", "construction_services"))
+    p_start.add_argument("--max-entities", type=_bounded_int("max entities", 1, 100), default=50)
+    p_start.add_argument("--max-searches", type=_bounded_int("max searches", 1, 50), default=20)
+    p_start.add_argument("--max-pages-per-entity", type=_bounded_int("max pages per entity", 1, 10), default=3)
+    p_start.add_argument("--max-total-pages", type=_bounded_int("max total pages", 1, 500), default=100)
+    p_start.add_argument("--worker-count", type=_bounded_int("worker count", 1, 8), default=4, help="Concurrent tasks, bounded to 1–8 (default: 4)")
+    p_start.add_argument("--max-retries", type=_bounded_int("max retries", 0, 5), default=2)
+    p_start.add_argument("--freshness-seconds", type=_bounded_int("freshness seconds", 0, 31536000), default=60 * 60 * 24 * 30)
+    p_start.add_argument("--time-budget-seconds", type=_bounded_int("time budget seconds", 1, 86400), help="Stop after this many seconds")
+    p_start.add_argument("--run", action="store_true"); p_start.set_defaults(func=cmd_mission_start)
+    p_resume = mission_sub.add_parser("resume", help="Resume a configured public-research mission")
+    p_resume.add_argument("mission_id"); p_resume.set_defaults(func=cmd_mission_resume)
+    p_pause = mission_sub.add_parser("pause", help="Pause a mission")
+    p_pause.add_argument("mission_id"); p_pause.set_defaults(func=cmd_mission_pause)
+    p_status = mission_sub.add_parser("status", help="Show persisted mission state")
+    p_status.add_argument("mission_id"); p_status.set_defaults(func=cmd_mission_status)
+    p_report = mission_sub.add_parser("report", help="Print persisted mission report")
+    p_report.add_argument("mission_id"); p_report.set_defaults(func=cmd_mission_report)
 
     args = parser.parse_args()
     args.func(args)

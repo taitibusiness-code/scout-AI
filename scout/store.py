@@ -11,12 +11,13 @@ companies" possible: watched businesses are just rows with watch=1.
 import json
 import re
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from dataclasses import asdict
 from urllib.parse import urlparse
 
-from .models import ENTITY_TYPES, Entity
+from .models import ENTITY_TYPES, MISSION_STATUSES, TASK_STATUSES, TASK_TYPES, Entity, Mission, ResearchTask
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidates (
@@ -47,8 +48,11 @@ CREATE TABLE IF NOT EXISTS source_observations (
     id TEXT PRIMARY KEY,
     candidate_id TEXT NOT NULL,
     source_url TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
     data TEXT NOT NULL,
-    UNIQUE(candidate_id, source_url)
+    -- Evidence is versioned: the same URL may be observed repeatedly.
+    -- Current views select the newest version rather than destroying history.
+    UNIQUE(id)
 );
 CREATE TABLE IF NOT EXISTS briefs (
     id TEXT PRIMARY KEY,
@@ -58,6 +62,35 @@ CREATE TABLE IF NOT EXISTS briefs (
     status TEXT NOT NULL DEFAULT 'new',
     watch INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS missions (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_tasks (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL,
+    entity_id TEXT,
+    task_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mission_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mission_reports (
+    mission_id TEXT PRIMARY KEY,
+    markdown TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -66,6 +99,53 @@ def _ensure_column(conn, table: str, column_definition: str) -> None:
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_definition}")
+
+
+def _has_legacy_observation_uniqueness(conn) -> bool:
+    """Whether an older database still allows only one version per URL."""
+    for row in conn.execute("PRAGMA index_list(source_observations)"):
+        if not row[2]:
+            continue
+        index_name = row[1]
+        columns = [item[2] for item in conn.execute(f"PRAGMA index_info({index_name})")]
+        if columns == ["candidate_id", "source_url"]:
+            return True
+    return False
+
+
+def _upgrade_source_observation_history(conn) -> None:
+    """Safely preserve legacy observations while allowing timestamped versions."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(source_observations)")}
+    if not columns or not _has_legacy_observation_uniqueness(conn):
+        return
+    conn.execute("SAVEPOINT source_observation_upgrade")
+    try:
+        conn.execute("ALTER TABLE source_observations RENAME TO source_observations_legacy")
+        conn.execute("""CREATE TABLE source_observations (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            data TEXT NOT NULL
+        )""")
+        for old_id, candidate_id, source_url, data in conn.execute(
+            "SELECT id, candidate_id, source_url, data FROM source_observations_legacy"
+        ):
+            try:
+                fetched_at = json.loads(data).get("fetched_at") or ""
+            except (TypeError, ValueError):
+                fetched_at = ""
+            conn.execute(
+                "INSERT INTO source_observations (id, candidate_id, source_url, fetched_at, data) VALUES (?, ?, ?, ?, ?)",
+                (old_id, candidate_id, source_url, fetched_at, data),
+            )
+        conn.execute("DROP TABLE source_observations_legacy")
+    except Exception:
+        conn.execute("ROLLBACK TO source_observation_upgrade")
+        conn.execute("RELEASE source_observation_upgrade")
+        raise
+    else:
+        conn.execute("RELEASE source_observation_upgrade")
 
 
 def normalize_domain(url_or_domain: str) -> str:
@@ -90,14 +170,18 @@ def validate_entity_type(entity_type: str) -> str:
 
 @contextmanager
 def connect(db_path: str):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _upgrade_source_observation_history(conn)
     _ensure_column(conn, "candidates", "entity_id TEXT")
     _ensure_column(conn, "briefs", "entity_id TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_entity_id ON candidates(entity_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_briefs_entity_id ON briefs(entity_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type_industry ON entities(entity_type, industry)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_primary_domain ON entities(primary_domain) WHERE primary_domain IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_mission_status_priority ON research_tasks(mission_id, status, priority, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_observations_candidate_url_time ON source_observations(candidate_id, source_url, fetched_at)")
     try:
         yield conn
         conn.commit()
@@ -231,20 +315,41 @@ def save_verification(db_path: str, verification) -> None:
 
 def save_source_observation(db_path: str, observation) -> None:
     """Persist bounded source evidence so a dossier can be audited later."""
-    observation_id = f"{observation.candidate_id}:{observation.source_url}"
+    observation_id = uuid.uuid4().hex
     with connect(db_path) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO source_observations (id, candidate_id, source_url, data) VALUES (?, ?, ?, ?)",
-            (observation_id, observation.candidate_id, observation.source_url, json.dumps(asdict(observation))),
+            "INSERT INTO source_observations (id, candidate_id, source_url, fetched_at, data) VALUES (?, ?, ?, ?, ?)",
+            (observation_id, observation.candidate_id, observation.source_url, observation.fetched_at, json.dumps(asdict(observation))),
         )
 
 
 def get_source_observations(db_path: str, candidate_id: str) -> list[dict]:
     with connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT data FROM source_observations WHERE candidate_id=? ORDER BY rowid", (candidate_id,)
+            "SELECT data FROM source_observations WHERE candidate_id=? ORDER BY fetched_at, rowid", (candidate_id,)
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+
+def latest_source_observations(db_path: str, candidate_id: str) -> list[dict]:
+    """Return only the newest observation of each URL for current assessment."""
+    latest: dict[str, dict] = {}
+    for observation in get_source_observations(db_path, candidate_id):
+        url = observation.get("source_url", "")
+        if url not in latest or observation.get("fetched_at", "") >= latest[url].get("fetched_at", ""):
+            latest[url] = observation
+    return list(latest.values())
+
+
+def observations_for_entity(db_path: str, entity_id: str) -> list[dict]:
+    """History is append-only across candidates; old observations are retained."""
+    candidate_ids = [item["id"] for item in candidates_for_entity(db_path, entity_id)]
+    return [observation for candidate_id in candidate_ids for observation in get_source_observations(db_path, candidate_id)]
+
+
+def latest_observation_for_entity(db_path: str, entity_id: str) -> dict | None:
+    observations = observations_for_entity(db_path, entity_id)
+    return max(observations, key=lambda item: item.get("fetched_at", ""), default=None)
 
 
 def load_dossier(db_path: str, candidate_id: str) -> dict:
@@ -259,7 +364,7 @@ def load_dossier(db_path: str, candidate_id: str) -> dict:
             "profile": one("profiles"),
             "verification": one("verifications"),
             "source_observations": [json.loads(row[0]) for row in conn.execute(
-                "SELECT data FROM source_observations WHERE candidate_id=? ORDER BY rowid", (candidate_id,)
+                "SELECT data FROM source_observations WHERE candidate_id=? ORDER BY fetched_at, rowid", (candidate_id,)
             ).fetchall()],
         }
 
@@ -303,3 +408,73 @@ def briefs_for_entities(db_path: str, entity_ids: list[str] | None = None) -> li
                 f"SELECT data FROM briefs WHERE entity_id IN ({placeholders}) ORDER BY rowid DESC", entity_ids
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+
+def save_mission(db_path: str, mission: Mission) -> Mission:
+    if mission.status not in MISSION_STATUSES:
+        raise ValueError(f"Invalid mission status: {mission.status}")
+    mission.updated_at = datetime.now(timezone.utc).isoformat()
+    with connect(db_path) as conn:
+        conn.execute("INSERT OR REPLACE INTO missions (id, status, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?)",
+                     (mission.id, mission.status, mission.created_at, mission.updated_at, json.dumps(asdict(mission))))
+    return mission
+
+
+def get_mission(db_path: str, mission_id: str) -> Mission | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT data FROM missions WHERE id=?", (mission_id,)).fetchone()
+    return Mission(**json.loads(row[0])) if row else None
+
+
+def list_missions(db_path: str) -> list[Mission]:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT data FROM missions ORDER BY created_at DESC").fetchall()
+    return [Mission(**json.loads(row[0])) for row in rows]
+
+
+def save_task(db_path: str, task: ResearchTask) -> ResearchTask:
+    if task.status not in TASK_STATUSES or task.task_type not in TASK_TYPES:
+        raise ValueError(f"Invalid task: {task.task_type}/{task.status}")
+    task.updated_at = datetime.now(timezone.utc).isoformat()
+    with connect(db_path) as conn:
+        conn.execute("INSERT OR REPLACE INTO research_tasks (id, mission_id, entity_id, task_type, status, priority, created_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     (task.id, task.mission_id, task.entity_id or None, task.task_type, task.status, task.priority, task.created_at, json.dumps(asdict(task))))
+    return task
+
+
+def tasks_for_mission(db_path: str, mission_id: str, status: str | None = None) -> list[ResearchTask]:
+    with connect(db_path) as conn:
+        if status:
+            rows = conn.execute("SELECT data FROM research_tasks WHERE mission_id=? AND status=? ORDER BY priority DESC, created_at", (mission_id, status)).fetchall()
+        else:
+            rows = conn.execute("SELECT data FROM research_tasks WHERE mission_id=? ORDER BY priority DESC, created_at", (mission_id,)).fetchall()
+    return [ResearchTask(**json.loads(row[0])) for row in rows]
+
+
+def next_task(db_path: str, mission_id: str) -> ResearchTask | None:
+    tasks = tasks_for_mission(db_path, mission_id, "PENDING")
+    return tasks[0] if tasks else None
+
+
+def log_mission_event(db_path: str, mission_id: str, event: str, data: dict | None = None) -> None:
+    with connect(db_path) as conn:
+        conn.execute("INSERT INTO mission_events (mission_id, event, created_at, data) VALUES (?, ?, ?, ?)",
+                     (mission_id, event, datetime.now(timezone.utc).isoformat(), json.dumps(data or {})))
+
+
+def mission_events(db_path: str, mission_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT event, created_at, data FROM mission_events WHERE mission_id=? ORDER BY id", (mission_id,)).fetchall()
+    return [{"event": row[0], "created_at": row[1], "data": json.loads(row[2])} for row in rows]
+
+
+def save_mission_report(db_path: str, mission_id: str, markdown: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute("INSERT OR REPLACE INTO mission_reports (mission_id, markdown, created_at) VALUES (?, ?, ?)",
+                     (mission_id, markdown, datetime.now(timezone.utc).isoformat()))
+
+
+def get_mission_report(db_path: str, mission_id: str) -> str | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT markdown FROM mission_reports WHERE mission_id=?", (mission_id,)).fetchone()
+    return row[0] if row else None
