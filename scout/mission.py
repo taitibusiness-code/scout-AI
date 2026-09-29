@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import monotonic, sleep
 from urllib.parse import urlparse, urljoin
+import re
 import random
 import threading
 
@@ -232,6 +233,7 @@ class ScoutMissionEngine:
             profile_reason = self._search_profile_reason(mission, candidate)
             if profile_reason:
                 candidate.campaign_status, candidate.campaign_reason = "out_of_profile", profile_reason
+                candidate.target_fit_outcome, candidate.target_fit_reason = "OUT_OF_PROFILE", profile_reason
                 store.save_candidate(self.db_path, candidate)
                 self._count(mission, "out_of_profile")
                 store.log_mission_event(self.db_path, mission.id, "CANDIDATE_OUT_OF_PROFILE", {"candidate_id": candidate.id, "reason": profile_reason})
@@ -266,6 +268,62 @@ class ScoutMissionEngine:
         # These are explicit public identity signals, not a size inference from a weak website.
         signals = ("carrefour", " franchise", " retail chain", " multinational")
         return "confirmed enterprise/chain identity signal for local_sme campaign" if any(signal in identity for signal in signals) else ""
+
+    @staticmethod
+    def _has_enterprise_signal(candidate: Candidate, text: str) -> bool:
+        """Use explicit public identity language, never a size guess from weak data."""
+        identity = f"{candidate.name} {store.normalize_domain(candidate.source_url)} {text}".lower()
+        # Kept intentionally short and visible: these are explicit chain/enterprise
+        # identity claims, not a hidden brand-size classifier.
+        return any(signal in identity for signal in (
+            "carrefour", " franchise", "retail chain", "multinational",
+            "part of the", "national chain",
+        ))
+
+    @staticmethod
+    def _local_business_evidence(mission: Mission, metadata: list[dict], text: str) -> tuple[bool, bool]:
+        """Return observed local location and direct Kenyan-contact evidence only."""
+        scope = (mission.geographic_scope or "").strip().lower()
+        location_observed = bool(scope and scope in text)
+        if not location_observed:
+            location_observed = any(place in text for place in (
+                "nairobi", "mombasa", "kisumu", "nakuru", "eldoret", "kenya",
+            ))
+        contacts = [str(number) for meta in metadata for number in meta.get("phone_numbers", [])]
+        emails = [str(email).lower() for meta in metadata for email in meta.get("emails", [])]
+        kenyan_phone = any(re.search(r"(?:\+?254|0)7\d{8}\b", number.replace(" ", "")) for number in contacts)
+        kenyan_email = any(email.endswith(".ke") for email in emails)
+        return location_observed, kenyan_phone or kenyan_email
+
+    def _assess_target_fit(self, mission: Mission, candidate: Candidate, metadata: list[dict], text: str,
+                           contact_observed: bool, substantive: list[OpportunityFinding],
+                           operations_need: bool) -> tuple[str, str]:
+        """Make a bounded campaign-fit decision without asserting revenue or size."""
+        profile = getattr(mission, "target_profile", "") or ""
+        if not profile:
+            return "NEEDS_HUMAN_REVIEW", "no target profile was set; legacy mission qualification is unchanged"
+        if profile == "unknown":
+            return "NEEDS_HUMAN_REVIEW", "target profile is unknown; public evidence cannot support strong ranking"
+        if profile == "local_sme":
+            if self._has_enterprise_signal(candidate, text):
+                return "OUT_OF_PROFILE", "explicit public enterprise or chain signal for a local-SME campaign"
+            if not contact_observed:
+                return "NEEDS_HUMAN_REVIEW", "no public business contact channel observed"
+            if not substantive:
+                return "NEEDS_HUMAN_REVIEW", "no specific observable digital gap beyond SEO metadata was observed"
+            location_observed, kenyan_contact = self._local_business_evidence(mission, metadata, text)
+            if not location_observed or not kenyan_contact:
+                return "NEEDS_HUMAN_REVIEW", "public evidence does not yet show both a local location and direct Kenyan business contact"
+            return "LIKELY_LOCAL_SME", "public local location, direct Kenyan contact, and actionable digital gap observed; no enterprise signal observed"
+        # Corporate operations has a different bar: public operational need,
+        # contact, and an actionable gap. It does not infer company size.
+        if not contact_observed:
+            return "NEEDS_HUMAN_REVIEW", "no public business contact channel observed"
+        if not substantive:
+            return "NEEDS_HUMAN_REVIEW", "no specific observable digital gap beyond SEO metadata was observed"
+        if not operations_need:
+            return "NEEDS_HUMAN_REVIEW", "no public operations-system need was observed"
+        return "NEEDS_HUMAN_REVIEW", "public operations-system need, contact, and actionable gap observed"
 
     def _investigate_task(self, mission: Mission, task: ResearchTask) -> None:
         entity = store.get_entity(self.db_path, task.entity_id)
@@ -354,39 +412,60 @@ class ScoutMissionEngine:
         substantive = [finding for finding in findings if finding.category != "possible_seo_structure_opportunity"]
         operations_terms = ("inventory", "stock", "workflow", "report", "dashboard", "booking", "appointment")
         operations_need = any(term in text for term in operations_terms)
-        reason = ""
-        if not contact_observed:
-            reason = "no public business contact channel observed"
-        elif not substantive:
-            reason = "no specific observable digital gap beyond SEO metadata"
-        elif mission.target_profile == "corporate_operations" and not operations_need:
-            reason = "no public inventory, workflow, reporting, booking, or operations-system need observed"
-        if reason:
+        outcome, reason = self._assess_target_fit(mission, candidate, metadata, text, contact_observed, substantive, operations_need)
+        candidate.target_fit_outcome, candidate.target_fit_reason = outcome, reason
+        candidate.campaign_reason = reason
+        candidate.campaign_status = "out_of_profile" if outcome == "OUT_OF_PROFILE" else "eligible"
+        store.save_candidate(self.db_path, candidate)
+        profile_name = getattr(mission, "target_profile", "") or ""
+        qualifies = (
+            not profile_name or
+            (profile_name == "local_sme" and outcome == "LIKELY_LOCAL_SME") or
+            (profile_name == "corporate_operations" and contact_observed and bool(substantive) and operations_need)
+        )
+        if not qualifies:
             brief = brief_mod.build_brief(candidate, profile, verification, [])
-            brief.status = "out_of_profile"
+            brief.status = "needs_human_review" if outcome == "NEEDS_HUMAN_REVIEW" else "out_of_profile"
             store.save_brief(self.db_path, brief)
-            self._count(mission, "out_of_profile")
-            task.result_summary = {"state": "out_of_profile", "reason": reason}
-            store.log_mission_event(self.db_path, mission.id, "ENTITY_OUT_OF_PROFILE", {"entity_id": entity.id, "reason": reason})
+            self._count(mission, "out_of_profile" if outcome == "OUT_OF_PROFILE" else "needs_human_review")
+            task.result_summary = {"state": "out_of_profile", "target_fit_outcome": outcome, "reason": reason}
+            store.log_mission_event(self.db_path, mission.id, "ENTITY_OUT_OF_PROFILE" if outcome == "OUT_OF_PROFILE" else "ENTITY_NEEDS_HUMAN_REVIEW", {"entity_id": entity.id, "reason": reason})
             return
         findings = substantive
         brief = brief_mod.build_brief(candidate, profile, verification, findings); store.save_brief(self.db_path, brief)
-        self._count(mission, "opportunities_found", len(findings)); task.result_summary = {"state": "evaluated", "findings": len(findings)}
+        self._count(mission, "opportunities_found", len(findings)); task.result_summary = {
+            "state": "evaluated", "findings": len(findings),
+            "target_fit_outcome": outcome, "reason": reason,
+        }
         store.log_mission_event(self.db_path, mission.id, "ENTITY_EVALUATED", task.result_summary)
 
     def build_report(self, mission_id: str) -> str:
         mission = self._mission(mission_id); tasks = store.tasks_for_mission(self.db_path, mission_id)
         failed = [task for task in tasks if task.status == "FAILED"]
         c = defaultdict(int, mission.counters)
-        ranked = intelligence.rank_opportunities(self.db_path)
-        strong = []
+        candidate_ids = {task.payload.get("candidate_id") for task in tasks if task.payload.get("candidate_id")}
+        entity_ids = list({task.entity_id for task in tasks if task.entity_id})
+        ranked = [item for item in intelligence.rank_opportunities(self.db_path, entity_ids)
+                  if item["candidate_id"] in candidate_ids]
+        strong, strong_candidate_ids = [], set()
         for item in ranked:
+            candidate_data = store.load_dossier(self.db_path, item["candidate_id"]).get("candidate") or {}
+            profile_name = getattr(mission, "target_profile", "") or ""
+            if profile_name == "local_sme" and candidate_data.get("target_fit_outcome") != "LIKELY_LOCAL_SME":
+                continue
+            if profile_name == "unknown":
+                continue
             entity = store.get_entity(self.db_path, item["entity_id"])
             capacity, factors = self._capacity(item["entity_id"])
             op = item["opportunity"]
-            strong.append(f"### {item['business_name']}\n- **Possible opportunity:** {op['opportunity']}\n- **Observed:** {op['observed']}\n- **Evidence:** {op['evidence_url']} — {op.get('evidence_excerpt', '')}\n- **Confidence / priority:** {op['confidence']} / {item['priority_score']}\n- **Solution:** {op.get('solution_pattern') or 'no pattern asserted'} / {op.get('alcatrax_capability') or 'none'}\n- **Past work:** {op.get('reference_project') or 'none asserted'}\n- **Public Business Readiness:** {capacity} ({'; '.join(factors) or 'insufficient public evidence'})\n- **Freshness:** {'recent' if entity and store.latest_observation_for_entity(self.db_path, entity.id) else 'unknown'}")
+            strong_candidate_ids.add(item["candidate_id"])
+            strong.append(f"### {item['business_name']}\n- **Target fit:** {candidate_data.get('target_fit_outcome', 'NEEDS_HUMAN_REVIEW')} — {candidate_data.get('target_fit_reason', 'not assessed')}\n- **Possible opportunity:** {op['opportunity']}\n- **Observed:** {op['observed']}\n- **Evidence:** {op['evidence_url']} — {op.get('evidence_excerpt', '')}\n- **Confidence / priority:** {op['confidence']} / {item['priority_score']}\n- **Solution:** {op.get('solution_pattern') or 'no pattern asserted'} / {op.get('alcatrax_capability') or 'none'}\n- **Past work:** {op.get('reference_project') or 'none asserted'}\n- **Public Business Readiness:** {capacity} ({'; '.join(factors) or 'insufficient public evidence'})\n- **Freshness:** {'recent' if entity and store.latest_observation_for_entity(self.db_path, entity.id) else 'unknown'}")
         insufficient = [task for task in tasks if task.task_type == "EVALUATE_ENTITY" and task.result_summary.get("state") == "insufficient_evidence"]
-        candidate_ids = {task.payload.get("candidate_id") for task in tasks if task.payload.get("candidate_id")}
+        needs_review = []
+        for candidate_id in sorted(candidate_ids):
+            candidate_data = store.load_dossier(self.db_path, candidate_id).get("candidate") or {}
+            if candidate_id not in strong_candidate_ids:
+                needs_review.append(f"- {candidate_data.get('name', candidate_id)}: **{candidate_data.get('target_fit_outcome', 'NEEDS_HUMAN_REVIEW')}** — {candidate_data.get('target_fit_reason', 'target fit was not assessed')}")
         all_observations = [item for candidate_id in candidate_ids for item in store.get_source_observations(self.db_path, candidate_id)]
         latest_observations = [item for candidate_id in candidate_ids for item in store.latest_source_observations(self.db_path, candidate_id)]
         limits = f"Workers: {mission.worker_count} (bounded 1–8)\\n\\nRetries per task: {mission.max_retries}\\n\\nFreshness window: {mission.freshness_seconds} seconds\\n\\nTime budget: {mission.time_budget_seconds or 'none'} seconds\\n\\nSearch limit: {mission.max_searches}\\n\\nEntity limit: {mission.max_entities}\\n\\nPages per entity: {mission.max_pages_per_entity}\\n\\nTotal page limit: {mission.max_total_pages}\\n\\nTarget profile: {mission.target_profile}"
@@ -403,7 +482,7 @@ class ScoutMissionEngine:
             )
             return f"- {task.task_type}: {task.error} [{details}]"
 
-        report = f"# Scout Mission Report\n\n## Mission\n\nObjective: {mission.objective}\n\nScope: {mission.geographic_scope}\n\nStatus: {mission.status}\n\nStop reason: {mission.stop_reason}\n\n## Effective Safety Limits\n\n{limits}\n\n## Activity\n\nSearches: {c['searches_executed']}\n\nBusinesses discovered: {c['candidates_discovered']}\n\nUnique entities: {c['unique_entities']}\n\nDuplicates: {c['duplicates_skipped']}\n\nEntities investigated: {c['entities_investigated']}\n\nPages fetched: {c['pages_fetched']}\n\nFailures: {c['failures']}\n\n## Evidence History\n\nLatest source observations: {len(latest_observations)}\n\nPrevious observation versions retained: {len(all_observations) - len(latest_observations)}\n\nAssessments use the latest observation per URL; earlier versions remain in SQLite for audit.\n\n## Market Coverage\n\nIndustries: {', '.join(mission.industries)}\n\nBusiness types: {', '.join(mission.business_types)}\n\n## Strong Evidence-Backed Opportunities\n\n" + ("\n\n".join(strong) if strong else "None identified from available evidence.") + "\n\n## Worth Deeper Investigation\n\n" + ("Entities with single-page or ambiguous coverage remain unranked." if not strong else "See insufficient-evidence items below where coverage was incomplete.") + "\n\n## Insufficient Evidence\n\n" + ("\n".join(f"- Entity task {task.entity_id}: coverage/fetch evidence was insufficient." for task in insufficient) if insufficient else "None.") + "\n\n## Failures\n\n" + ("\n".join(failure_line(task) for task in failed) if failed else "None.") + "\n\n## Mission Summary\n\nThis report contains public, deterministic evidence only. Public Business Readiness is a public-web sales-prioritisation signal, not proof of revenue, creditworthiness, or financial health."
+        report = f"# Scout Mission Report\n\n## Mission\n\nObjective: {mission.objective}\n\nScope: {mission.geographic_scope}\n\nStatus: {mission.status}\n\nStop reason: {mission.stop_reason}\n\n## Effective Safety Limits\n\n{limits}\n\n## Activity\n\nSearches: {c['searches_executed']}\n\nBusinesses discovered: {c['candidates_discovered']}\n\nUnique entities: {c['unique_entities']}\n\nDuplicates: {c['duplicates_skipped']}\n\nEntities investigated: {c['entities_investigated']}\n\nPages fetched: {c['pages_fetched']}\n\nFailures: {c['failures']}\n\n## Evidence History\n\nLatest source observations: {len(latest_observations)}\n\nPrevious observation versions retained: {len(all_observations) - len(latest_observations)}\n\nAssessments use the latest observation per URL; earlier versions remain in SQLite for audit.\n\n## Market Coverage\n\nIndustries: {', '.join(mission.industries)}\n\nBusiness types: {', '.join(mission.business_types)}\n\n## Strong Evidence-Backed Opportunities\n\n" + ("\n\n".join(strong) if strong else "None identified from available evidence.") + "\n\n## Needs Human Review\n\n" + ("\n".join(needs_review) if needs_review else "None.") + "\n\n## Insufficient Evidence\n\n" + ("\n".join(f"- Entity task {task.entity_id}: coverage/fetch evidence was insufficient." for task in insufficient) if insufficient else "None.") + "\n\n## Failures\n\n" + ("\n".join(failure_line(task) for task in failed) if failed else "None.") + "\n\n## Mission Summary\n\nThis report contains public, deterministic evidence only. Target-fit outcomes describe only the observed public signals and do not prove ability to pay, revenue, owner status, or company size. Public Business Readiness is a public-web sales-prioritisation signal, not proof of revenue, creditworthiness, or financial health."
         store.save_mission_report(self.db_path, mission_id, report); return report
 
     def _capacity(self, entity_id: str) -> tuple[str, list[str]]:

@@ -47,7 +47,9 @@ class Mission:
     geographic_scope: str = ""
     industries: list[str] = field(default_factory=list)
     business_types: list[str] = field(default_factory=list)
-    target_profile: str = "local_sme"
+    # Blank means a mission saved by an older Scout version, before campaign
+    # qualification existed.  New missions explicitly choose a profile.
+    target_profile: str = ""
     max_entities: int = 50
     max_searches: int = 20
     max_pages_per_entity: int = 3
@@ -98,6 +100,8 @@ class Candidate:
     entity_id: str = ""        # canonical Entity id, resolved after profile extraction
     campaign_status: str = "unknown"  # eligible | out_of_profile | unknown
     campaign_reason: str = ""
+    target_fit_outcome: str = "NEEDS_HUMAN_REVIEW"
+    target_fit_reason: str = "target fit has not yet been assessed"
     discovered_at: str = field(default_factory=_now)
 
 

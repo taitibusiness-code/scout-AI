@@ -60,6 +60,14 @@ class MetadataOnlyBrowser(BrowserProvider):
         })
 
 
+class LocalBusinessGapBrowser(BrowserProvider):
+    def fetch(self, url, timeout=15, max_chars=8000):
+        return FetchResult(url, 200, "Acme", "Acme Hardware, Tom Mboya Street, Nairobi. Products and stock available.", {
+            "phone_numbers": ["+254700000000"], "emails": [], "has_whatsapp_link": True,
+            "has_ecommerce_words": False, "meta_description": "", "has_json_ld": True,
+        })
+
+
 class BlockingBrowser(BrowserProvider):
     """Blocks active fetches so the scheduler's actual overlap is observable."""
     def __init__(self, expected_parallel=2):
@@ -257,6 +265,45 @@ class MissionEngineTests(unittest.TestCase):
         evaluation = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "EVALUATE_ENTITY")
         self.assertEqual("out_of_profile", evaluation.result_summary["state"])
         self.assertIn("beyond SEO metadata", evaluation.result_summary["reason"])
+
+    def test_local_sme_gap_without_positive_local_evidence_needs_review_not_strong(self):
+        engine = ScoutMissionEngine(self.db, FakeSearch(), ContactGapBrowser())
+        mission = engine.create("local", "Nairobi", ["retail_local"], target_profile="local_sme",
+                                max_searches=1, max_pages_per_entity=1)
+        engine.run(mission.id)
+        evaluation = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "EVALUATE_ENTITY")
+        self.assertEqual("NEEDS_HUMAN_REVIEW", evaluation.result_summary["target_fit_outcome"])
+        report = store.get_mission_report(self.db, mission.id)
+        self.assertIn("## Needs Human Review", report)
+        self.assertIn("None identified from available evidence.", report)
+
+    def test_local_sme_address_kenyan_contact_and_gap_can_be_strong(self):
+        engine = ScoutMissionEngine(self.db, FakeSearch(), LocalBusinessGapBrowser())
+        mission = engine.create("local", "Nairobi", ["retail_local"], target_profile="local_sme",
+                                max_searches=1, max_pages_per_entity=1)
+        engine.run(mission.id)
+        evaluation = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "EVALUATE_ENTITY")
+        self.assertEqual("LIKELY_LOCAL_SME", evaluation.result_summary["target_fit_outcome"])
+        report = store.get_mission_report(self.db, mission.id)
+        self.assertIn("## Strong Evidence-Backed Opportunities", report)
+        self.assertIn("**Target fit:** LIKELY_LOCAL_SME", report)
+
+    def test_explicit_enterprise_signal_is_out_of_profile_for_local_sme(self):
+        engine = ScoutMissionEngine(self.db, FakeSearch([SearchHit("Carrefour Kenya", "https://carrefour.example")]), ContactGapBrowser())
+        mission = engine.create("local", "Nairobi", ["retail_local"], target_profile="local_sme", max_searches=1)
+        engine.run(mission.id)
+        with sqlite3.connect(self.db) as conn:
+            raw = conn.execute("SELECT data FROM candidates").fetchone()[0]
+        self.assertEqual("OUT_OF_PROFILE", json.loads(raw)["target_fit_outcome"])
+
+    def test_corporate_operations_qualifying_lead_and_safe_fit_reason_render(self):
+        engine = ScoutMissionEngine(self.db, FakeSearch([SearchHit("Carrefour Kenya", "https://carrefour.example")]), ContactGapBrowser())
+        mission = engine.create("operations", "Nairobi", ["retail_local"], target_profile="corporate_operations",
+                                max_searches=1, max_pages_per_entity=1)
+        engine.run(mission.id)
+        report = store.get_mission_report(self.db, mission.id)
+        self.assertIn("## Strong Evidence-Backed Opportunities", report)
+        self.assertIn("**Target fit:** NEEDS_HUMAN_REVIEW — public operations-system need, contact, and actionable gap observed", report)
 
     def test_observation_versions_are_retained_and_latest_view_is_distinct(self):
         candidate = __import__("scout.models", fromlist=["Candidate"]).Candidate(name="Acme")
