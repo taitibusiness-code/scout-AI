@@ -147,6 +147,7 @@ class ScoutMissionEngine:
             batch, domains = [], set()
             search_slots = max(0, mission.max_searches - mission.counters.get("searches_executed", 0))
             page_slots = max(0, mission.max_total_pages - mission.counters.get("pages_fetched", 0))
+            entity_slots = max(0, mission.max_entities - mission.counters.get("unique_entities", 0))
             for task in eligible:
                 if task.task_type == "SEARCH":
                     # A retry belongs to an already-admitted search task; only a
@@ -154,9 +155,12 @@ class ScoutMissionEngine:
                     if not task.attempts:
                         if not search_slots: continue
                         search_slots -= 1
-                if task.task_type == "FETCH_PAGE":
+                if task.task_type in ("FETCH_PAGE", "PLACE_VERIFY"):
                     if not page_slots: continue
                     page_slots -= 1
+                if task.task_type == "PLACE_VERIFY":
+                    if not entity_slots: continue
+                    entity_slots -= 1
                 domain = store.normalize_domain(task.payload.get("url", "")) if task.task_type == "FETCH_PAGE" else ""
                 if domain and domain in domains:
                     continue
@@ -177,6 +181,7 @@ class ScoutMissionEngine:
             self._count(mission, "searches_executed")
         try:
             if task.task_type == "SEARCH": self._search_task(mission, task)
+            elif task.task_type == "PLACE_VERIFY": self._place_verify_task(mission, task)
             elif task.task_type == "FETCH_PAGE": self._fetch_task(mission, task)
             elif task.task_type in ("INVESTIGATE_ENTITY", "REVISIT_ENTITY"): self._investigate_task(mission, task)
             elif task.task_type == "EVALUATE_ENTITY": self._evaluate_task(mission, task)
@@ -226,9 +231,40 @@ class ScoutMissionEngine:
         seen = set()
         for hit in hits:
             domain = store.normalize_domain(hit.url)
-            if not domain or domain in seen: self._count(mission, "duplicates_skipped"); continue
+            provenance = "google_places" if hit.metadata.get("provider") == "google_places" else "web"
+            if provenance == "google_places":
+                # Never persist any Text Search field.  The ID is the sole
+                # durable handle; website resolution happens only in memory.
+                store.save_task(self.db_path, ResearchTask(mission_id=mission.id, task_type="PLACE_VERIFY", priority=58,
+                    max_attempts=mission.max_retries + 1, payload={"place_id": hit.metadata.get("place_id", ""), "source": "google_places"}))
+                task.result_summary.setdefault("places_discovered", 0); task.result_summary["places_discovered"] += 1
+                if hit.metadata.get("maps_only"): task.result_summary.setdefault("places_without_first_party_site", 0); task.result_summary["places_without_first_party_site"] += 1
+                continue
+            # Places listings without a first-party website are discovery-only
+            # transient data.  Do not persist their listing content or browse Maps.
+            if not domain:
+                if hit.metadata.get("provider") == "google_places":
+                    task.result_summary.setdefault("places_without_first_party_site", 0)
+                    task.result_summary["places_without_first_party_site"] += 1
+                self._count(mission, "duplicates_skipped"); continue
+            if domain in seen:
+                # A web and Places result can arrive in the same bounded query.
+                # Merge durable provenance by domain; raw Places identity fields
+                # deliberately never leave the provider metadata.
+                if provenance == "google_places":
+                    existing = store.find_entity_by_domain(self.db_path, domain)
+                    if existing:
+                        for previous in store.candidates_for_entity(self.db_path, existing.id):
+                            if previous.get("source_provenance") == "web":
+                                previous["source_provenance"] = "both"
+                                previous["place_id"] = hit.metadata.get("place_id", "")
+                                store.save_candidate(self.db_path, Candidate(**previous))
+                                break
+                self._count(mission, "duplicates_skipped"); continue
             seen.add(domain)
-            candidate = Candidate(name=hit.title or domain, source="mission_search", source_url=hit.url, query=task.payload["query"])
+            candidate = Candidate(name=hit.title or domain, source="mission_search", source_provenance=provenance,
+                                  place_id=hit.metadata.get("place_id", "") if provenance == "google_places" else "",
+                                  source_url=hit.url, query=task.payload["query"])
             store.save_candidate(self.db_path, candidate)
             profile_reason = self._search_profile_reason(mission, candidate)
             if profile_reason:
@@ -240,6 +276,15 @@ class ScoutMissionEngine:
                 continue
             existing = store.find_entity_by_domain(self.db_path, domain)
             if existing:
+                # Keep provenance without retaining transient Places phone/address data.
+                existing_candidates = store.candidates_for_entity(self.db_path, existing.id)
+                if provenance == "google_places":
+                    for previous in existing_candidates:
+                        if previous.get("source_provenance") == "web":
+                            previous["source_provenance"] = "both"
+                            previous["place_id"] = candidate.place_id
+                            store.save_candidate(self.db_path, Candidate(**previous))
+                            break
                 latest = store.latest_observation_for_entity(self.db_path, existing.id)
                 if latest and not latest.get("error") and (latest.get("status_code") or 0) < 400 and self._fresh(latest.get("fetched_at", ""), mission.freshness_seconds):
                     self._count(mission, "duplicates_skipped"); self._count(mission, "recent_entities_skipped"); continue
@@ -255,7 +300,42 @@ class ScoutMissionEngine:
             store.save_task(self.db_path, ResearchTask(mission_id=mission.id, entity_id=entity.id, parent_task_id=task.id,
                                                         task_type="INVESTIGATE_ENTITY", priority=60, payload={"url": hit.url, "candidate_id": candidate.id}))
             self._count(mission, "unique_entities"); store.log_mission_event(self.db_path, mission.id, "ENTITY_DISCOVERED", {"entity_id": entity.id})
-        task.result_summary = {"hits": len(hits)}; store.log_mission_event(self.db_path, mission.id, "SEARCH_COMPLETED", task.result_summary)
+        task.result_summary["hits"] = len(hits); store.log_mission_event(self.db_path, mission.id, "SEARCH_COMPLETED", {"hits": len(hits)})
+
+    def _place_provider(self):
+        providers = getattr(self.search, "providers", [self.search])
+        return next((item for item in providers if getattr(item, "provider_name", "") == "google_places"), None)
+
+    def _place_verify_task(self, mission: Mission, task: ResearchTask) -> None:
+        provider = self._place_provider()
+        if provider is None: raise RuntimeError("Google Places provider unavailable")
+        website = provider.website_uri(task.payload.get("place_id", ""))
+        if not website:
+            self._count(mission, "places_skipped")
+            task.result_summary = {"state": "PLACE_NO_VERIFIABLE_FIRST_PARTY_SITE"}; return
+        self.politeness.wait(website); result = self.browser.fetch(website)
+        if result.error or (result.status_code and result.status_code >= 400):
+            self._count(mission, "places_failures")
+            task.result_summary = {"state": "PLACE_FIRST_PARTY_FETCH_FAILED"}; return
+        domain = store.normalize_domain(result.url)
+        if not domain: task.result_summary = {"state": "PLACE_NO_VERIFIABLE_FIRST_PARTY_SITE"}; return
+        existing = store.find_entity_by_domain(self.db_path, domain)
+        if existing:
+            task.result_summary = {"state": "PLACE_VERIFIED_DUPLICATE", "place_id": task.payload["place_id"]}; return
+        candidate = Candidate(name=result.title or domain, source="mission_search", source_provenance="google_places_verified",
+                              place_id=task.payload["place_id"], source_url=result.url, query="")
+        store.save_candidate(self.db_path, candidate)
+        entity = store.resolve_entity(self.db_path, candidate.name, result.url, mission.geographic_scope, industry="")
+        store.link_candidate_to_entity(self.db_path, candidate, entity.id)
+        observation = SourceObservation(candidate_id=candidate.id, source_url=result.url, fetched_at=_now(),
+            status_code=result.status_code, title=result.title, evidence_excerpt=result.text_content[:500], html_meta=result.html_meta or {}, error=None)
+        observation.facts = [SourceFact("title", result.title or "", result.url, (result.title or "")[:200], confidence="observed")]
+        store.save_source_observation(self.db_path, observation)
+        self._count(mission, "pages_fetched"); self._count(mission, "places_verified_first_party_pages")
+        self._count(mission, "unique_entities"); self._count(mission, "entities_investigated")
+        store.save_task(self.db_path, ResearchTask(mission_id=mission.id, entity_id=entity.id, task_type="EVALUATE_ENTITY", priority=30,
+            payload={"candidate_id": candidate.id}))
+        task.result_summary = {"state": "PLACE_FIRST_PARTY_VERIFIED", "place_id": task.payload["place_id"]}
 
     @staticmethod
     def _search_profile_reason(mission: Mission, candidate: Candidate) -> str:
@@ -512,7 +592,7 @@ class ScoutMissionEngine:
 
     def _limit_reached(self, mission: Mission, task: ResearchTask) -> bool:
         c = mission.counters
-        return (task.task_type == "SEARCH" and not task.attempts and c.get("searches_executed", 0) >= mission.max_searches) or (task.task_type == "INVESTIGATE_ENTITY" and c.get("unique_entities", 0) > mission.max_entities) or (task.task_type == "FETCH_PAGE" and c.get("pages_fetched", 0) >= mission.max_total_pages)
+        return (task.task_type == "SEARCH" and not task.attempts and c.get("searches_executed", 0) >= mission.max_searches) or (task.task_type == "INVESTIGATE_ENTITY" and c.get("unique_entities", 0) > mission.max_entities) or (task.task_type == "PLACE_VERIFY" and c.get("unique_entities", 0) >= mission.max_entities) or (task.task_type in ("FETCH_PAGE", "PLACE_VERIFY") and c.get("pages_fetched", 0) >= mission.max_total_pages)
 
     @staticmethod
     def _validate_limits(limits: dict) -> None:

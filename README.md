@@ -109,6 +109,23 @@ same provider-neutral result shape regardless of source.
 - **Serper** — Google-style result provider; treat its one-time free
   allocation as a reserve fallback, not a normal daily provider.
 - **Google CSE** — retained for existing setups that select `google_cse`.
+- **Google Places API (New)** — optional, disabled by default, for official
+  Google Maps business-listing discovery. Enable billing in Google Cloud and
+  enable **Places API (New)** before setting `PLACES_PROVIDER_ENABLED=true` and
+  `GOOGLE_MAPS_API_KEY`. Scout never scrapes or automates Google Maps.
+
+Places discovery uses only Text Search (New) with Nairobi bias and a strict
+field mask: place ID, display name, address/location, permitted phone, website,
+business status, and Maps URI. It never requests photos, ratings, reviews, AI
+summaries, or other nonessential fields; ratings/reviews are never sales-fit
+signals. Places data is discovery context only: Maps URLs are never browsed and
+a listing without a first-party website is not persisted as a candidate. Scout
+persists only the permitted place ID and source provenance for a Places-derived
+candidate; phone/address/listing fields remain transient until independently
+observed on a permitted first-party public page. Google Places content is not
+used to make a Strong lead decision.
+
+This follows Google's [Places API policies](https://developers.google.com/maps/documentation/places/web-service/policies): place IDs may be retained (Google recommends refreshing them after 12 months), while Scout chooses not to retain Places display-name, address, phone, website, Maps URI, business-status, or latitude/longitude data. Latitude/longitude is therefore not cached even though the service terms allow a limited cache period. If a future UI displays Google-derived content, it must add the required Google attribution; Scout's CLI does not display that content.
 
 Free allowances, quotas, and pricing change. Check each provider dashboard
 before relying on any plan or using it in a recurring workflow.
@@ -179,6 +196,15 @@ Stored-data commands and `python -m scout.cli --help` require neither. Run
 python -m scout.cli discover "automotive spare parts shop Nairobi" --max 8
 python -m scout.cli list
 python -m scout.cli watch <brief_id>     # mark for periodic re-checking later
+```
+
+For missions, web remains the default. To opt in to official Places discovery:
+
+```bash
+export PLACES_PROVIDER_ENABLED=true
+export GOOGLE_MAPS_API_KEY=replace_me
+python -m scout.cli mission start --objective "Find local hardware shops" --location Nairobi \
+  --industry retail_local --business-type "hardware shops" --discovery-sources web,places --run
 ```
 
 ## Mission Engine (Phase 2.4)

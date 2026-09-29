@@ -22,7 +22,7 @@ ENTITY_TYPES = ("prospect", "competitor", "industry_reference")
 TARGET_PROFILES = ("local_sme", "corporate_operations", "unknown")
 MISSION_STATUSES = ("PENDING", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "STOPPED")
 TASK_STATUSES = ("PENDING", "RUNNING", "COMPLETED", "FAILED", "SKIPPED")
-TASK_TYPES = ("GENERATE_SEARCH", "SEARCH", "INVESTIGATE_ENTITY", "FETCH_PAGE", "RECON_ENTITY", "VERIFY_ENTITY", "EVALUATE_ENTITY", "REVISIT_ENTITY", "BUILD_REPORT")
+TASK_TYPES = ("GENERATE_SEARCH", "SEARCH", "PLACE_VERIFY", "INVESTIGATE_ENTITY", "FETCH_PAGE", "RECON_ENTITY", "VERIFY_ENTITY", "EVALUATE_ENTITY", "REVISIT_ENTITY", "BUILD_REPORT")
 
 
 @dataclass
@@ -95,6 +95,8 @@ class Candidate:
     id: str = field(default_factory=_uid)
     name: str = ""
     source: str = ""          # e.g. "google_cse", "manual"
+    source_provenance: str = "web"  # web | google_places | both
+    place_id: str = ""         # Google Place ID only; no cached Places content
     source_url: str = ""      # the search result URL that pointed at it
     query: str = ""           # the discover query that produced this
     entity_id: str = ""        # canonical Entity id, resolved after profile extraction

@@ -14,6 +14,8 @@ Environment variables (validated by the command that needs them):
   EXA_API_KEY               - Exa search credential (default search provider)
   TAVILY_API_KEY            - Tavily search credential
   SERPER_API_KEY            - Serper search credential
+  GOOGLE_MAPS_API_KEY       - Google Maps Platform credential for Places API (New)
+  PLACES_PROVIDER_ENABLED   - true only when Places discovery is deliberately enabled
   SEARCH_PROVIDER           - exa (default), tavily, serper, or google_cse
   SEARCH_PROVIDERS          - ordered explicit fallback chain; takes precedence
 
@@ -34,6 +36,8 @@ class Config:
     exa_api_key: str | None
     tavily_api_key: str | None
     serper_api_key: str | None
+    google_maps_api_key: str | None
+    places_provider_enabled: bool
     search_provider: str
     search_providers: tuple[str, ...]
     db_path: str
@@ -78,6 +82,8 @@ def load_config(require_llm: bool = False) -> Config:
         exa_api_key=os.environ.get("EXA_API_KEY"),
         tavily_api_key=os.environ.get("TAVILY_API_KEY"),
         serper_api_key=os.environ.get("SERPER_API_KEY"),
+        google_maps_api_key=os.environ.get("GOOGLE_MAPS_API_KEY"),
+        places_provider_enabled=os.environ.get("PLACES_PROVIDER_ENABLED", "false").strip().lower() == "true",
         search_provider=search_provider,
         search_providers=search_providers,
         db_path=os.environ.get("SCOUT_DB_PATH", "./scout.db"),

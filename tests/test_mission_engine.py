@@ -29,6 +29,34 @@ class FailingSearch(SearchProvider):
         raise self.error
 
 
+class FakePlaces(SearchProvider):
+    provider_name = "google_places"
+    def __init__(self, website="", details_error=None):
+        self.website, self.details_error, self.search_calls, self.detail_calls = website, details_error, 0, 0
+        self.place_id = "place-id-safe"
+    def search(self, query, num_results=10):
+        self.search_calls += 1
+        return [SearchHit("MAPS_SENTINEL_NAME", self.website, "", {"provider": "google_places", "place_id": self.place_id,
+            "maps_only": not bool(self.website), "places_identity": {"formattedAddress": "MAPS_SENTINEL_ADDRESS", "nationalPhoneNumber": "MAPS_SENTINEL_PHONE", "googleMapsUri": "MAPS_SENTINEL_URI"}})]
+    def website_uri(self, place_id):
+        self.detail_calls += 1
+        if self.details_error: raise self.details_error
+        return self.website
+
+
+class PlacesOnlySearch(SearchProvider):
+    provider_name = "combined_discovery"
+    def __init__(self, places): self.providers = [places]
+    def search(self, query, num_results=10): return self.providers[0].search(query, num_results)
+
+
+class FirstPartyBrowser(BrowserProvider):
+    def __init__(self): self.urls = []
+    def fetch(self, url, timeout=15, max_chars=8000):
+        self.urls.append(url)
+        return FetchResult("https://verified.test/", 200, "FIRST_PARTY_TITLE", "Nairobi products and stock", {"phone_numbers": ["+254700000000"], "links": []})
+
+
 class FakeBrowser(BrowserProvider):
     def __init__(self, fail=False): self.fail = fail; self.urls = []
     def fetch(self, url, timeout=15, max_chars=8000):
@@ -257,6 +285,40 @@ class MissionEngineTests(unittest.TestCase):
         self.assertEqual(1, done.counters["unique_entities"])
         evaluation = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "EVALUATE_ENTITY")
         self.assertEqual("evaluated", evaluation.result_summary["state"])
+
+    def test_places_search_uses_one_logical_budget_and_no_site_persists_only_id(self):
+        places = FakePlaces(); engine = ScoutMissionEngine(self.db, PlacesOnlySearch(places), FakeBrowser())
+        mission = engine.create("places", "Nairobi", ["retail_local"], max_searches=1, max_entities=2, max_total_pages=2)
+        done = engine.run(mission.id)
+        self.assertEqual(1, places.search_calls); self.assertEqual(1, done.counters["searches_executed"])
+        self.assertEqual(0, done.counters.get("pages_fetched", 0)); self.assertEqual([], store.list_entities(self.db))
+        with sqlite3.connect(self.db) as conn:
+            persisted = "\n".join(str(value) for row in conn.execute("SELECT data FROM research_tasks") for value in row)
+        self.assertIn("place-id-safe", persisted)
+        for sentinel in ("MAPS_SENTINEL_NAME", "MAPS_SENTINEL_ADDRESS", "MAPS_SENTINEL_PHONE", "MAPS_SENTINEL_URI"):
+            self.assertNotIn(sentinel, persisted)
+
+    def test_places_details_failure_creates_no_candidate_or_listing_leak(self):
+        places = FakePlaces("https://maps-sentinel.example", TransientSearchError("details", provider="Google Places"))
+        engine = ScoutMissionEngine(self.db, PlacesOnlySearch(places), FakeBrowser())
+        mission = engine.create("places", "Nairobi", ["retail_local"], max_searches=1, max_entities=2, max_total_pages=2, max_retries=0)
+        engine.run(mission.id)
+        self.assertEqual([], store.list_entities(self.db))
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0])
+
+    def test_places_verification_uses_first_party_only_and_respects_page_entity_caps(self):
+        places, browser = FakePlaces("https://maps-sentinel.example"), FirstPartyBrowser()
+        engine = ScoutMissionEngine(self.db, PlacesOnlySearch(places), browser)
+        mission = engine.create("places", "Nairobi", ["retail_local"], max_searches=1, max_entities=1, max_total_pages=1, max_pages_per_entity=1)
+        done = engine.run(mission.id)
+        self.assertEqual(1, done.counters["unique_entities"]); self.assertEqual(1, done.counters["pages_fetched"])
+        candidate = store.candidates_for_entity(self.db, store.list_entities(self.db)[0].id)[0]
+        self.assertEqual("FIRST_PARTY_TITLE", candidate["name"]); self.assertEqual("verified.test", store.list_entities(self.db)[0].primary_domain)
+        with sqlite3.connect(self.db) as conn:
+            persisted = "\n".join(str(value) for row in conn.execute("SELECT data FROM candidates UNION ALL SELECT data FROM research_tasks UNION ALL SELECT data FROM entities" ) for value in row)
+        for sentinel in ("MAPS_SENTINEL_NAME", "MAPS_SENTINEL_ADDRESS", "MAPS_SENTINEL_PHONE", "MAPS_SENTINEL_URI", "maps-sentinel.example"):
+            self.assertNotIn(sentinel, persisted)
 
     def test_metadata_only_gap_is_out_of_profile(self):
         engine = ScoutMissionEngine(self.db, FakeSearch(), MetadataOnlyBrowser())

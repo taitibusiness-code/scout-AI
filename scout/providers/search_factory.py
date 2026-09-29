@@ -8,6 +8,7 @@ from .search_errors import (AllSearchProvidersFailed, SearchConfigurationError,
                             SearchRequestError, TransientSearchError)
 from .serper_search import SerperSearchProvider
 from .tavily_search import TavilySearchProvider
+from .google_places import GooglePlacesProvider
 
 SEARCH_PROVIDER_NAMES = ("exa", "tavily", "serper", "google_cse")
 
@@ -46,3 +47,27 @@ def build_search_provider(cfg) -> SearchProvider:
     names = cfg.search_providers or (cfg.search_provider,)
     providers = [_provider_for(name, cfg) for name in names]
     return providers[0] if len(providers) == 1 else FallbackSearchProvider(providers)
+
+
+class CombinedDiscoveryProvider(SearchProvider):
+    """Combine explicitly selected discovery sources without changing web fallback semantics."""
+    provider_name = "combined_discovery"
+
+    def __init__(self, providers: list[SearchProvider]): self.providers = providers
+
+    def search(self, query: str, num_results: int = 10):
+        hits = []
+        for provider in self.providers:
+            hits.extend(provider.search(query, num_results))
+        return hits
+
+
+def build_discovery_provider(cfg, sources: tuple[str, ...] = ("web",)) -> SearchProvider:
+    if not sources or any(source not in ("web", "places") for source in sources):
+        raise SearchConfigurationError("Discovery sources must be web, places, or web,places.")
+    providers = []
+    if "web" in sources:
+        providers.append(build_search_provider(cfg))
+    if "places" in sources:
+        providers.append(GooglePlacesProvider(cfg.google_maps_api_key, cfg.places_provider_enabled))
+    return providers[0] if len(providers) == 1 else CombinedDiscoveryProvider(providers)

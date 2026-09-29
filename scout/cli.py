@@ -20,7 +20,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 from .config import load_config
-from .providers.search_factory import build_search_provider
+from .providers.search_factory import build_discovery_provider, build_search_provider
 from .providers.requests_browser import RequestsBrowserProvider
 from . import intelligence, pipeline, store
 from .mission import ScoutMissionEngine
@@ -134,6 +134,7 @@ def doctor_report(cfg) -> list[str]:
         "exa": bool(cfg.exa_api_key), "tavily": bool(cfg.tavily_api_key), "serper": bool(cfg.serper_api_key),
         "google_cse": bool(cfg.google_cse_api_key and cfg.google_cse_cx),
     }
+    lines.append(f"Google Places API (New): {'enabled and configured' if cfg.places_provider_enabled and cfg.google_maps_api_key else 'disabled or missing GOOGLE_MAPS_API_KEY'}")
     for name in chain:
         lines.append(f"Search provider {name}: {'configured' if credential_state[name] else 'missing credentials'}")
     if cfg.llm_provider == "ollama":
@@ -159,30 +160,41 @@ def cmd_doctor(args):
         print(line)
 
 
-def _mission_engine(args, live: bool = False):
+def _discovery_sources(value: str | None) -> tuple[str, ...]:
+    sources = tuple(dict.fromkeys(part.strip().lower() for part in (value or "web").split(",") if part.strip()))
+    if not sources or any(source not in ("web", "places") for source in sources):
+        raise SystemExit("--discovery-sources must be web, places, or web,places")
+    return sources
+
+
+def _mission_engine(args, live: bool = False, sources: tuple[str, ...] = ("web",)):
     cfg = load_config(require_llm=False)
     if not live:
         return ScoutMissionEngine(cfg.db_path)
     # The deterministic Mission Engine does not call an LLM; do not require or
     # initialize one just to perform bounded public-web research.
-    return ScoutMissionEngine(cfg.db_path, build_search_provider(cfg), RequestsBrowserProvider())
+    return ScoutMissionEngine(cfg.db_path, build_discovery_provider(cfg, sources), RequestsBrowserProvider())
 
 
 def cmd_mission_start(args):
     engine = _mission_engine(args, live=False)
+    sources = _discovery_sources(args.discovery_sources)
     mission = engine.create(args.objective, args.location, args.industry,
                             max_entities=args.max_entities, max_searches=args.max_searches,
                             max_pages_per_entity=args.max_pages_per_entity, max_total_pages=args.max_total_pages,
                             worker_count=args.worker_count, max_retries=args.max_retries,
                             freshness_seconds=args.freshness_seconds, time_budget_seconds=args.time_budget_seconds,
                             business_types=args.business_type, target_profile=args.target_profile)
+    mission.metadata["discovery_sources"] = list(sources); store.save_mission(load_config(require_llm=False).db_path, mission)
     print(mission.id)
     if args.run:
-        _mission_engine(args, live=True).run(mission.id)
+        _mission_engine(args, live=True, sources=sources).run(mission.id)
 
 
 def cmd_mission_resume(args):
-    _mission_engine(args, live=True).run(args.mission_id)
+    cfg = load_config(require_llm=False); mission = store.get_mission(cfg.db_path, args.mission_id)
+    if not mission: raise SystemExit(f"Unknown mission: {args.mission_id}")
+    _mission_engine(args, live=True, sources=tuple(mission.metadata.get("discovery_sources", ["web"]))).run(args.mission_id)
 
 
 def cmd_mission_pause(args):
@@ -257,6 +269,7 @@ def main():
     p_start.add_argument("--industry", action="append", choices=("automotive", "hospitality", "health_fitness", "education_professional", "retail_local", "construction_services"))
     p_start.add_argument("--business-type", action="append", help="Restrict planning to a listed business type for the selected industry")
     p_start.add_argument("--target-profile", choices=("local_sme", "corporate_operations", "unknown"), default="local_sme")
+    p_start.add_argument("--discovery-sources", default="web", help="Comma-separated: web, places, or web,places (default: web)")
     p_start.add_argument("--max-entities", type=_bounded_int("max entities", 1, 100), default=50)
     p_start.add_argument("--max-searches", type=_bounded_int("max searches", 1, 50), default=20)
     p_start.add_argument("--max-pages-per-entity", type=_bounded_int("max pages per entity", 1, 10), default=3)
