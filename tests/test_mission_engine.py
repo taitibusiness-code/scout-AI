@@ -4,17 +4,29 @@ import time
 import json
 import sqlite3
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from scout import store
 from scout.mission import DomainPoliteness, ScoutMissionEngine, plan_queries, prioritise_pages
 from scout.models import Mission
 from scout.providers.base import BrowserProvider, FetchResult, SearchHit, SearchProvider
+from scout.providers.exa_search import ExaSearchProvider
+from scout.providers.search_errors import SearchRequestError, TransientSearchError
 
 
 class FakeSearch(SearchProvider):
     def __init__(self, hits=None): self.hits = hits or [SearchHit("Acme Hardware", "https://acme.test", "tools")]
     def search(self, query, num_results=10): return self.hits
+
+
+class FailingSearch(SearchProvider):
+    provider_name = "exa"
+
+    def __init__(self, error): self.error, self.calls = error, 0
+    def search(self, query, num_results=10):
+        self.calls += 1
+        raise self.error
 
 
 class FakeBrowser(BrowserProvider):
@@ -87,12 +99,58 @@ class MissionEngineTests(unittest.TestCase):
         self.assertGreaterEqual(done.counters["pages_fetched"], 3)
         self.assertIn("# Scout Mission Report", store.get_mission_report(self.db, mission.id))
 
-    def test_failed_page_retries_then_mission_continues(self):
+    def test_unclassified_page_failure_is_not_retried(self):
         engine = ScoutMissionEngine(self.db, FakeSearch(), FakeBrowser(fail=True))
         mission = engine.create("Find hardware", "Nairobi", ["retail_local"], max_searches=1, max_retries=1)
         done = engine.run(mission.id)
         failures = [task for task in store.tasks_for_mission(self.db, mission.id) if task.status == "FAILED"]
-        self.assertTrue(failures); self.assertEqual(2, failures[0].attempts); self.assertIn(done.status, ("STOPPED", "COMPLETED"))
+        self.assertTrue(failures); self.assertEqual(1, failures[0].attempts); self.assertIn(done.status, ("STOPPED", "COMPLETED"))
+
+    def test_search_budget_counts_started_searches_including_failures(self):
+        search = FailingSearch(SearchRequestError("Exa search request failed.", provider="Exa"))
+        engine = ScoutMissionEngine(self.db, search, FakeBrowser())
+        mission = engine.create("budget", "Nairobi", ["retail_local"], max_searches=2, max_retries=1)
+        done = engine.run(mission.id)
+        search_tasks = [task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "SEARCH" and task.attempts]
+        self.assertEqual(2, search.calls)
+        self.assertEqual(2, len(search_tasks))
+        self.assertEqual(2, done.counters["searches_executed"])
+
+    def test_non_transient_search_error_is_not_retried(self):
+        search = FailingSearch(SearchRequestError("Exa search request failed.", provider="Exa"))
+        engine = ScoutMissionEngine(self.db, search, FakeBrowser())
+        mission = engine.create("non-transient", "Nairobi", ["retail_local"], max_searches=1, max_retries=1)
+        engine.run(mission.id)
+        task = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "SEARCH" and task.attempts)
+        self.assertEqual(1, search.calls); self.assertEqual(1, task.attempts)
+        self.assertEqual([False], [item["retry"] for item in task.result_summary["failure_diagnostics"]])
+
+    def test_transient_search_error_retries_to_configured_limit(self):
+        search = FailingSearch(TransientSearchError("Exa search timed out.", provider="Exa", native_error_type="Timeout"))
+        engine = ScoutMissionEngine(self.db, search, FakeBrowser())
+        mission = engine.create("transient", "Nairobi", ["retail_local"], max_searches=1, max_retries=1)
+        engine.run(mission.id)
+        task = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "SEARCH" and task.attempts)
+        self.assertEqual(2, search.calls); self.assertEqual(2, task.attempts)
+        self.assertEqual([True, False], [item["retry"] for item in task.result_summary["failure_diagnostics"]])
+
+    def test_search_failure_diagnostics_are_safe_and_reported(self):
+        import requests
+        raw_native_text = "DO_NOT_PERSIST_this_native_error_text"
+        engine = ScoutMissionEngine(self.db, ExaSearchProvider("not-a-real-key"), FakeBrowser())
+        mission = engine.create("diagnostics", "Nairobi", ["retail_local"], max_searches=1, max_retries=1)
+        with patch("scout.providers.exa_search.requests.post", side_effect=requests.RequestException(raw_native_text)):
+            engine.run(mission.id)
+        task = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "SEARCH" and task.attempts)
+        diagnostic = task.result_summary["failure_diagnostics"][0]
+        self.assertEqual({"provider", "error_type", "native_error_type", "http_status", "retry"}, set(diagnostic))
+        self.assertEqual("Exa", diagnostic["provider"]); self.assertEqual("SearchRequestError", diagnostic["error_type"])
+        self.assertEqual("RequestException", diagnostic["native_error_type"]); self.assertIsNone(diagnostic["http_status"])
+        report = store.get_mission_report(self.db, mission.id)
+        self.assertIn("native_error_type=RequestException", report); self.assertNotIn(raw_native_text, report)
+        with sqlite3.connect(self.db) as conn:
+            persisted = "\n".join(row[0] for row in conn.execute("SELECT data FROM research_tasks WHERE mission_id=?", (mission.id,)))
+        self.assertNotIn(raw_native_text, persisted)
 
     def test_pause_and_report_need_no_providers(self):
         engine = ScoutMissionEngine(self.db); mission = engine.create("Research", "Nairobi", ["automotive"])

@@ -13,6 +13,7 @@ from . import store
 from .models import Candidate, Mission, ResearchTask, SourceFact, SourceObservation, BusinessProfile, VerificationResult, OpportunityFinding
 from . import alcatrax_knowledge as brain, brief as brief_mod, intelligence
 from .taxonomy import business_types_for, normalize_industries
+from .providers.search_errors import SearchProviderError, TransientSearchError
 
 
 class DomainPoliteness:
@@ -133,8 +134,11 @@ class ScoutMissionEngine:
             page_slots = max(0, mission.max_total_pages - mission.counters.get("pages_fetched", 0))
             for task in eligible:
                 if task.task_type == "SEARCH":
-                    if not search_slots: continue
-                    search_slots -= 1
+                    # A retry belongs to an already-admitted search task; only a
+                    # first attempt consumes the hard logical-search budget.
+                    if not task.attempts:
+                        if not search_slots: continue
+                        search_slots -= 1
                 if task.task_type == "FETCH_PAGE":
                     if not page_slots: continue
                     page_slots -= 1
@@ -154,6 +158,8 @@ class ScoutMissionEngine:
 
     def _execute(self, mission: Mission, task: ResearchTask) -> None:
         task.status, task.started_at, task.attempts = "RUNNING", _now(), task.attempts + 1; store.save_task(self.db_path, task)
+        if task.task_type == "SEARCH" and task.attempts == 1:
+            self._count(mission, "searches_executed")
         try:
             if task.task_type == "SEARCH": self._search_task(mission, task)
             elif task.task_type == "FETCH_PAGE": self._fetch_task(mission, task)
@@ -163,14 +169,18 @@ class ScoutMissionEngine:
             task.status, task.completed_at, task.error = "COMPLETED", _now(), ""
         except HTTPTaskError as error:
             task.error = str(error)
-            if error.transient and task.attempts < task.max_attempts:
+            retry = error.transient and task.attempts < task.max_attempts
+            self._record_failure_diagnostic(task, error, retry)
+            if retry:
                 task.status, task.priority = "PENDING", task.priority - 1
                 sleep(min(0.05 * (2 ** (task.attempts - 1)) + random.random() * 0.01, 0.2))
             else:
                 task.status, task.completed_at = "FAILED", _now(); self._count(mission, "failures")
         except Exception as error:
-            task.error = str(error)
-            if task.attempts < task.max_attempts:
+            retry = isinstance(error, TransientSearchError) and task.attempts < task.max_attempts
+            task.error = str(error) if isinstance(error, SearchProviderError) else "Task failed unexpectedly."
+            self._record_failure_diagnostic(task, error, retry)
+            if retry:
                 task.status = "PENDING"; task.priority -= 1
                 sleep(min(0.05 * (2 ** (task.attempts - 1)) + random.random() * 0.01, 0.2))
             else:
@@ -178,9 +188,23 @@ class ScoutMissionEngine:
                 self._count(mission, "failures")
         store.save_task(self.db_path, task)
 
+    def _record_failure_diagnostic(self, task: ResearchTask, error: Exception, retry: bool) -> None:
+        """Persist only safe, structured failure facts; never exception text."""
+        provider = getattr(error, "provider", "")
+        if not provider and task.task_type == "SEARCH":
+            provider = getattr(self.search, "provider_name", "")
+        diagnostic = {
+            "provider": provider,
+            "error_type": type(error).__name__,
+            "native_error_type": getattr(error, "native_error_type", ""),
+            "http_status": getattr(error, "http_status", None),
+            "retry": retry,
+        }
+        task.result_summary.setdefault("failure_diagnostics", []).append(diagnostic)
+
     def _search_task(self, mission: Mission, task: ResearchTask) -> None:
         hits = self.search.search(task.payload["query"], num_results=10)
-        self._count(mission, "searches_executed"); self._count(mission, "candidates_discovered", len(hits))
+        self._count(mission, "candidates_discovered", len(hits))
         seen = set()
         for hit in hits:
             domain = store.normalize_domain(hit.url)
@@ -308,7 +332,20 @@ class ScoutMissionEngine:
         all_observations = [item for candidate_id in candidate_ids for item in store.get_source_observations(self.db_path, candidate_id)]
         latest_observations = [item for candidate_id in candidate_ids for item in store.latest_source_observations(self.db_path, candidate_id)]
         limits = f"Workers: {mission.worker_count} (bounded 1–8)\\n\\nRetries per task: {mission.max_retries}\\n\\nFreshness window: {mission.freshness_seconds} seconds\\n\\nTime budget: {mission.time_budget_seconds or 'none'} seconds\\n\\nSearch limit: {mission.max_searches}\\n\\nEntity limit: {mission.max_entities}\\n\\nPages per entity: {mission.max_pages_per_entity}\\n\\nTotal page limit: {mission.max_total_pages}"
-        report = f"# Scout Mission Report\n\n## Mission\n\nObjective: {mission.objective}\n\nScope: {mission.geographic_scope}\n\nStatus: {mission.status}\n\nStop reason: {mission.stop_reason}\n\n## Effective Safety Limits\n\n{limits}\n\n## Activity\n\nSearches: {c['searches_executed']}\n\nBusinesses discovered: {c['candidates_discovered']}\n\nUnique entities: {c['unique_entities']}\n\nDuplicates: {c['duplicates_skipped']}\n\nEntities investigated: {c['entities_investigated']}\n\nPages fetched: {c['pages_fetched']}\n\nFailures: {c['failures']}\n\n## Evidence History\n\nLatest source observations: {len(latest_observations)}\n\nPrevious observation versions retained: {len(all_observations) - len(latest_observations)}\n\nAssessments use the latest observation per URL; earlier versions remain in SQLite for audit.\n\n## Market Coverage\n\nIndustries: {', '.join(mission.industries)}\n\nBusiness types: {', '.join(mission.business_types)}\n\n## Strong Evidence-Backed Opportunities\n\n" + ("\n\n".join(strong) if strong else "None identified from available evidence.") + "\n\n## Worth Deeper Investigation\n\n" + ("Entities with single-page or ambiguous coverage remain unranked." if not strong else "See insufficient-evidence items below where coverage was incomplete.") + "\n\n## Insufficient Evidence\n\n" + ("\n".join(f"- Entity task {task.entity_id}: coverage/fetch evidence was insufficient." for task in insufficient) if insufficient else "None.") + "\n\n## Failures\n\n" + ("\n".join(f"- {task.task_type}: {task.error}" for task in failed) if failed else "None.") + "\n\n## Mission Summary\n\nThis report contains public, deterministic evidence only. Public Business Readiness is a public-web sales-prioritisation signal, not proof of revenue, creditworthiness, or financial health."
+        def failure_line(task: ResearchTask) -> str:
+            diagnostics = task.result_summary.get("failure_diagnostics", [])
+            if not diagnostics:
+                return f"- {task.task_type}: {task.error}"
+            details = "; ".join(
+                f"provider={item['provider'] or 'unknown'}, error_type={item['error_type']}, "
+                f"native_error_type={item['native_error_type'] or 'none'}, "
+                f"http_status={item['http_status'] if item['http_status'] is not None else 'none'}, "
+                f"retry={'yes' if item['retry'] else 'no'}"
+                for item in diagnostics
+            )
+            return f"- {task.task_type}: {task.error} [{details}]"
+
+        report = f"# Scout Mission Report\n\n## Mission\n\nObjective: {mission.objective}\n\nScope: {mission.geographic_scope}\n\nStatus: {mission.status}\n\nStop reason: {mission.stop_reason}\n\n## Effective Safety Limits\n\n{limits}\n\n## Activity\n\nSearches: {c['searches_executed']}\n\nBusinesses discovered: {c['candidates_discovered']}\n\nUnique entities: {c['unique_entities']}\n\nDuplicates: {c['duplicates_skipped']}\n\nEntities investigated: {c['entities_investigated']}\n\nPages fetched: {c['pages_fetched']}\n\nFailures: {c['failures']}\n\n## Evidence History\n\nLatest source observations: {len(latest_observations)}\n\nPrevious observation versions retained: {len(all_observations) - len(latest_observations)}\n\nAssessments use the latest observation per URL; earlier versions remain in SQLite for audit.\n\n## Market Coverage\n\nIndustries: {', '.join(mission.industries)}\n\nBusiness types: {', '.join(mission.business_types)}\n\n## Strong Evidence-Backed Opportunities\n\n" + ("\n\n".join(strong) if strong else "None identified from available evidence.") + "\n\n## Worth Deeper Investigation\n\n" + ("Entities with single-page or ambiguous coverage remain unranked." if not strong else "See insufficient-evidence items below where coverage was incomplete.") + "\n\n## Insufficient Evidence\n\n" + ("\n".join(f"- Entity task {task.entity_id}: coverage/fetch evidence was insufficient." for task in insufficient) if insufficient else "None.") + "\n\n## Failures\n\n" + ("\n".join(failure_line(task) for task in failed) if failed else "None.") + "\n\n## Mission Summary\n\nThis report contains public, deterministic evidence only. Public Business Readiness is a public-web sales-prioritisation signal, not proof of revenue, creditworthiness, or financial health."
         store.save_mission_report(self.db_path, mission_id, report); return report
 
     def _capacity(self, entity_id: str) -> tuple[str, list[str]]:
@@ -338,7 +375,7 @@ class ScoutMissionEngine:
 
     def _limit_reached(self, mission: Mission, task: ResearchTask) -> bool:
         c = mission.counters
-        return (task.task_type == "SEARCH" and c.get("searches_executed", 0) >= mission.max_searches) or (task.task_type == "INVESTIGATE_ENTITY" and c.get("unique_entities", 0) > mission.max_entities) or (task.task_type == "FETCH_PAGE" and c.get("pages_fetched", 0) >= mission.max_total_pages)
+        return (task.task_type == "SEARCH" and not task.attempts and c.get("searches_executed", 0) >= mission.max_searches) or (task.task_type == "INVESTIGATE_ENTITY" and c.get("unique_entities", 0) > mission.max_entities) or (task.task_type == "FETCH_PAGE" and c.get("pages_fetched", 0) >= mission.max_total_pages)
 
     @staticmethod
     def _validate_limits(limits: dict) -> None:

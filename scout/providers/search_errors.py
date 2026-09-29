@@ -5,6 +5,13 @@ from __future__ import annotations
 class SearchProviderError(RuntimeError):
     """A safe error suitable for CLI output; it must never contain a key."""
 
+    def __init__(self, message: str, *, provider: str = "", native_error_type: str = "",
+                 http_status: int | None = None):
+        super().__init__(message)
+        self.provider = provider
+        self.native_error_type = native_error_type
+        self.http_status = http_status
+
 
 class SearchConfigurationError(SearchProviderError):
     """Missing credentials or an unsupported provider selection."""
