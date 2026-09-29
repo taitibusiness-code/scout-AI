@@ -99,7 +99,21 @@ never acts on anything without you. This is intentional for v1.
 
 ## Provider configuration
 
-Scout is local-first by default:
+Scout uses a pluggable web-search provider. **Exa is the default**; Google CSE
+remains supported but is no longer required. The search adapter returns the
+same provider-neutral result shape regardless of source.
+
+- **Exa** — default general web search provider.
+- **Tavily** — alternate web-search provider for an explicitly configured
+  fallback chain.
+- **Serper** — Google-style result provider; treat its one-time free
+  allocation as a reserve fallback, not a normal daily provider.
+- **Google CSE** — retained for existing setups that select `google_cse`.
+
+Free allowances, quotas, and pricing change. Check each provider dashboard
+before relying on any plan or using it in a recurring workflow.
+
+Local LLM mode remains:
 
 ```text
 Google CSE → RequestsBrowserProvider → Ollama qwen3:8b
@@ -114,6 +128,33 @@ Local mode:
 export SCOUT_LLM_PROVIDER=ollama
 export SCOUT_OLLAMA_MODEL=qwen3:8b
 export SCOUT_OLLAMA_BASE_URL=http://127.0.0.1:11434
+export EXA_API_KEY=replace_me
+export SEARCH_PROVIDER=exa
+```
+
+One provider can be selected explicitly:
+
+```bash
+export SEARCH_PROVIDER=tavily
+export TAVILY_API_KEY=replace_me
+```
+
+Or configure an ordered fallback chain. Scout advances only after timeout,
+connection failure, HTTP 429, or HTTP 5xx; credentials, malformed requests,
+and invalid responses stop clearly rather than silently consuming another
+provider's quota.
+
+```bash
+export SEARCH_PROVIDERS=exa,tavily,serper
+export EXA_API_KEY=replace_me
+export TAVILY_API_KEY=replace_me
+export SERPER_API_KEY=replace_me
+```
+
+Existing Google CSE setup remains available:
+
+```bash
+export SEARCH_PROVIDER=google_cse
 export GOOGLE_CSE_API_KEY=replace_me
 export GOOGLE_CSE_CX=replace_me
 ```
@@ -123,12 +164,13 @@ Optional cloud mode:
 ```bash
 export SCOUT_LLM_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=replace_me
-export GOOGLE_CSE_API_KEY=replace_me
-export GOOGLE_CSE_CX=replace_me
+export EXA_API_KEY=replace_me
+export SEARCH_PROVIDER=exa
 ```
 
-`discover` requires Google CSE credentials and the selected LLM. Stored-data
-commands and `python -m scout.cli --help` require neither. Run
+`discover` requires the selected search provider's credentials and the
+selected LLM. Mission `--run` requires only the selected search provider.
+Stored-data commands and `python -m scout.cli --help` require neither. Run
 `python -m scout.cli doctor` for a secret-safe local readiness report.
 
 ## Run it

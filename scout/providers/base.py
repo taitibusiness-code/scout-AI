@@ -16,6 +16,7 @@ class SearchHit:
     title: str
     url: str
     snippet: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

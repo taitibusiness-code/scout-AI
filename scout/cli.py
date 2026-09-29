@@ -20,7 +20,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 from .config import load_config
-from .providers.google_cse import GoogleCSEProvider
+from .providers.search_factory import build_search_provider
 from .providers.requests_browser import RequestsBrowserProvider
 from . import intelligence, pipeline, store
 from .mission import ScoutMissionEngine
@@ -44,9 +44,7 @@ def _bounded_int(label: str, minimum: int, maximum: int):
 
 
 def _build_providers(cfg):
-    if not (cfg.google_cse_api_key and cfg.google_cse_cx):
-        raise RuntimeError("GOOGLE_CSE_API_KEY/GOOGLE_CSE_CX not set.")
-    search = GoogleCSEProvider(cfg.google_cse_api_key, cfg.google_cse_cx)
+    search = build_search_provider(cfg)
     browser = RequestsBrowserProvider()
     if cfg.llm_provider == "ollama":
         from .providers.ollama_llm import OllamaLLMProvider
@@ -130,9 +128,14 @@ def cmd_market_summary(args):
 
 def doctor_report(cfg) -> list[str]:
     """Diagnostic only; never prints credentials or performs a search."""
-    lines = ["Python: OK", f"Google CSE API key: {'configured' if cfg.google_cse_api_key else 'missing'}",
-             f"Google CSE CX: {'configured' if cfg.google_cse_cx else 'missing'}",
-             f"Selected LLM provider: {cfg.llm_provider}"]
+    chain = cfg.search_providers or (cfg.search_provider,)
+    lines = ["Python: OK", f"Search provider chain: {' -> '.join(chain)}", f"Selected LLM provider: {cfg.llm_provider}"]
+    credential_state = {
+        "exa": bool(cfg.exa_api_key), "tavily": bool(cfg.tavily_api_key), "serper": bool(cfg.serper_api_key),
+        "google_cse": bool(cfg.google_cse_api_key and cfg.google_cse_cx),
+    }
+    for name in chain:
+        lines.append(f"Search provider {name}: {'configured' if credential_state[name] else 'missing credentials'}")
     if cfg.llm_provider == "ollama":
         lines.append(f"Ollama endpoint: {cfg.ollama_base_url}")
         try:
@@ -160,11 +163,9 @@ def _mission_engine(args, live: bool = False):
     cfg = load_config(require_llm=False)
     if not live:
         return ScoutMissionEngine(cfg.db_path)
-    if not (cfg.google_cse_api_key and cfg.google_cse_cx):
-        raise RuntimeError("GOOGLE_CSE_API_KEY/GOOGLE_CSE_CX not set.")
     # The deterministic Mission Engine does not call an LLM; do not require or
     # initialize one just to perform bounded public-web research.
-    return ScoutMissionEngine(cfg.db_path, GoogleCSEProvider(cfg.google_cse_api_key, cfg.google_cse_cx), RequestsBrowserProvider())
+    return ScoutMissionEngine(cfg.db_path, build_search_provider(cfg), RequestsBrowserProvider())
 
 
 def cmd_mission_start(args):

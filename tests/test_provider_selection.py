@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from scout import cli, config
 from scout.providers.ollama_llm import OllamaLLMProvider
+from scout.providers.search_factory import build_search_provider
 
 
 class ProviderSelectionTests(unittest.TestCase):
@@ -15,11 +16,12 @@ class ProviderSelectionTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             cfg = config.load_config(require_llm=True)
         self.assertEqual("ollama", cfg.llm_provider)
+        self.assertEqual("exa", cfg.search_provider)
         self.assertEqual("qwen3:8b", cfg.ollama_model)
         self.assertEqual("http://127.0.0.1:11434", cfg.ollama_base_url)
 
     def test_ollama_does_not_require_anthropic_or_import_it(self):
-        env = {"SCOUT_LLM_PROVIDER": "ollama", "GOOGLE_CSE_API_KEY": "key", "GOOGLE_CSE_CX": "cx"}
+        env = {"SCOUT_LLM_PROVIDER": "ollama", "EXA_API_KEY": "key"}
         with patch.dict(os.environ, env, clear=True):
             cfg = config.load_config(require_llm=True)
             self.assertIsNone(cfg.anthropic_api_key)
@@ -36,8 +38,7 @@ class ProviderSelectionTests(unittest.TestCase):
                 config.load_config()
 
     def test_anthropic_sdk_fails_only_when_anthropic_is_selected(self):
-        env = {"SCOUT_LLM_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": "key",
-               "GOOGLE_CSE_API_KEY": "google", "GOOGLE_CSE_CX": "cx"}
+        env = {"SCOUT_LLM_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": "key", "EXA_API_KEY": "exa"}
         with patch.dict(os.environ, env, clear=True):
             cfg = config.load_config(require_llm=True)
             with self.assertRaisesRegex(RuntimeError, "Anthropic SDK"):
@@ -49,11 +50,24 @@ class ProviderSelectionTests(unittest.TestCase):
         self.assertEqual("qwen2.5:3b", cfg.ollama_model)
         self.assertEqual("http://local.test:1234", cfg.ollama_base_url)
 
-    def test_discovery_boundary_requires_google_credentials(self):
+    def test_discovery_boundary_requires_selected_search_credentials(self):
         with patch.dict(os.environ, {"SCOUT_LLM_PROVIDER": "ollama"}, clear=True):
             cfg = config.load_config(require_llm=True)
-            with self.assertRaisesRegex(RuntimeError, "GOOGLE_CSE"):
+            with self.assertRaisesRegex(RuntimeError, "EXA_API_KEY"):
                 cli._build_providers(cfg)
+
+    def test_google_cse_remains_selectable(self):
+        env = {"SEARCH_PROVIDER": "google_cse", "GOOGLE_CSE_API_KEY": "key", "GOOGLE_CSE_CX": "cx"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual("GoogleCSEProvider", type(build_search_provider(config.load_config())).__name__)
+
+    def test_doctor_reports_search_chain_without_credential_values(self):
+        env = {"SEARCH_PROVIDERS": "exa,tavily", "EXA_API_KEY": "secret-exa", "TAVILY_API_KEY": "secret-tavily", "SCOUT_LLM_PROVIDER": "anthropic", "ANTHROPIC_API_KEY": "secret-anthropic"}
+        with patch.dict(os.environ, env, clear=True):
+            lines = cli.doctor_report(config.load_config())
+        output = "\n".join(lines)
+        self.assertIn("Search provider chain: exa -> tavily", output)
+        self.assertNotIn("secret-", output)
 
     def test_help_and_stored_data_command_need_no_provider_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
