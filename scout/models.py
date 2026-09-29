@@ -19,6 +19,7 @@ def _uid() -> str:
 
 
 ENTITY_TYPES = ("prospect", "competitor", "industry_reference")
+TARGET_PROFILES = ("local_sme", "corporate_operations", "unknown")
 MISSION_STATUSES = ("PENDING", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "STOPPED")
 TASK_STATUSES = ("PENDING", "RUNNING", "COMPLETED", "FAILED", "SKIPPED")
 TASK_TYPES = ("GENERATE_SEARCH", "SEARCH", "INVESTIGATE_ENTITY", "FETCH_PAGE", "RECON_ENTITY", "VERIFY_ENTITY", "EVALUATE_ENTITY", "REVISIT_ENTITY", "BUILD_REPORT")
@@ -46,6 +47,7 @@ class Mission:
     geographic_scope: str = ""
     industries: list[str] = field(default_factory=list)
     business_types: list[str] = field(default_factory=list)
+    target_profile: str = "local_sme"
     max_entities: int = 50
     max_searches: int = 20
     max_pages_per_entity: int = 3
@@ -94,6 +96,8 @@ class Candidate:
     source_url: str = ""      # the search result URL that pointed at it
     query: str = ""           # the discover query that produced this
     entity_id: str = ""        # canonical Entity id, resolved after profile extraction
+    campaign_status: str = "unknown"  # eligible | out_of_profile | unknown
+    campaign_reason: str = ""
     discovered_at: str = field(default_factory=_now)
 
 

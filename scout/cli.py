@@ -174,7 +174,8 @@ def cmd_mission_start(args):
                             max_entities=args.max_entities, max_searches=args.max_searches,
                             max_pages_per_entity=args.max_pages_per_entity, max_total_pages=args.max_total_pages,
                             worker_count=args.worker_count, max_retries=args.max_retries,
-                            freshness_seconds=args.freshness_seconds, time_budget_seconds=args.time_budget_seconds)
+                            freshness_seconds=args.freshness_seconds, time_budget_seconds=args.time_budget_seconds,
+                            business_types=args.business_type, target_profile=args.target_profile)
     print(mission.id)
     if args.run:
         _mission_engine(args, live=True).run(mission.id)
@@ -254,6 +255,8 @@ def main():
     p_start = mission_sub.add_parser("start", help="Create a bounded public-web mission; --run requires Google CSE and respects robots.txt")
     p_start.add_argument("--objective", required=True); p_start.add_argument("--location", default="")
     p_start.add_argument("--industry", action="append", choices=("automotive", "hospitality", "health_fitness", "education_professional", "retail_local", "construction_services"))
+    p_start.add_argument("--business-type", action="append", help="Restrict planning to a listed business type for the selected industry")
+    p_start.add_argument("--target-profile", choices=("local_sme", "corporate_operations", "unknown"), default="local_sme")
     p_start.add_argument("--max-entities", type=_bounded_int("max entities", 1, 100), default=50)
     p_start.add_argument("--max-searches", type=_bounded_int("max searches", 1, 50), default=20)
     p_start.add_argument("--max-pages-per-entity", type=_bounded_int("max pages per entity", 1, 10), default=3)

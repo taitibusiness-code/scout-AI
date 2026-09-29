@@ -44,6 +44,22 @@ class StatusBrowser(BrowserProvider):
         return FetchResult(url, self.status, "Acme", "products services", {"links": ["/contact"]})
 
 
+class ContactGapBrowser(BrowserProvider):
+    def fetch(self, url, timeout=15, max_chars=8000):
+        return FetchResult(url, 200, "Acme", "Products and stock available", {
+            "phone_numbers": ["+254700000000"], "emails": [], "has_whatsapp_link": False,
+            "has_ecommerce_words": False, "meta_description": "", "has_json_ld": False,
+        })
+
+
+class MetadataOnlyBrowser(BrowserProvider):
+    def fetch(self, url, timeout=15, max_chars=8000):
+        return FetchResult(url, 200, "Acme", "Welcome to our business", {
+            "phone_numbers": ["+254700000000"], "emails": [], "has_whatsapp_link": False,
+            "has_ecommerce_words": False, "meta_description": "", "has_json_ld": False,
+        })
+
+
 class BlockingBrowser(BrowserProvider):
     """Blocks active fetches so the scheduler's actual overlap is observable."""
     def __init__(self, expected_parallel=2):
@@ -206,6 +222,42 @@ class MissionEngineTests(unittest.TestCase):
         report = engine.build_report(mission.id)
         self.assertIn("Workers: 1 (bounded 1–8)", report); self.assertIn("Time budget: 5 seconds", report)
 
+    def test_campaign_profile_narrows_queries_and_excludes_chain_only_for_local_sme(self):
+        hits = [SearchHit("Carrefour Kenya", "https://carrefour.example"), SearchHit("Acme Hardware", "https://acme.test")]
+        engine = ScoutMissionEngine(self.db, FakeSearch(hits), ContactGapBrowser())
+        mission = engine.create("hardware", "Nairobi", ["retail_local"], business_types=["hardware shops"],
+                                target_profile="local_sme", max_searches=1, max_entities=1, max_pages_per_entity=1)
+        self.assertEqual([("retail_local", "hardware shops Nairobi")], plan_queries(mission))
+        done = engine.run(mission.id)
+        self.assertEqual(1, done.counters["unique_entities"])
+        self.assertGreaterEqual(done.counters["out_of_profile"], 1)
+        self.assertEqual("Acme Hardware", store.list_entities(self.db)[0].canonical_name)
+        self.assertIn("CANDIDATE_OUT_OF_PROFILE", [event["event"] for event in store.mission_events(self.db, mission.id)])
+
+    def test_unknown_profile_never_admits_an_entity(self):
+        engine = ScoutMissionEngine(self.db, FakeSearch(), ContactGapBrowser())
+        mission = engine.create("unknown", "Nairobi", ["retail_local"], target_profile="unknown", max_searches=1)
+        done = engine.run(mission.id)
+        self.assertEqual(0, done.counters.get("unique_entities", 0))
+        self.assertGreaterEqual(done.counters.get("out_of_profile", 0), 1)
+
+    def test_corporate_operations_allows_chain_when_public_operations_need_exists(self):
+        engine = ScoutMissionEngine(self.db, FakeSearch([SearchHit("Carrefour Kenya", "https://carrefour.example")]), ContactGapBrowser())
+        mission = engine.create("operations", "Nairobi", ["retail_local"], target_profile="corporate_operations",
+                                max_searches=1, max_entities=1, max_pages_per_entity=1)
+        done = engine.run(mission.id)
+        self.assertEqual(1, done.counters["unique_entities"])
+        evaluation = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "EVALUATE_ENTITY")
+        self.assertEqual("evaluated", evaluation.result_summary["state"])
+
+    def test_metadata_only_gap_is_out_of_profile(self):
+        engine = ScoutMissionEngine(self.db, FakeSearch(), MetadataOnlyBrowser())
+        mission = engine.create("metadata", "Nairobi", ["retail_local"], max_searches=1, max_pages_per_entity=1)
+        engine.run(mission.id)
+        evaluation = next(task for task in store.tasks_for_mission(self.db, mission.id) if task.task_type == "EVALUATE_ENTITY")
+        self.assertEqual("out_of_profile", evaluation.result_summary["state"])
+        self.assertIn("beyond SEO metadata", evaluation.result_summary["reason"])
+
     def test_observation_versions_are_retained_and_latest_view_is_distinct(self):
         candidate = __import__("scout.models", fromlist=["Candidate"]).Candidate(name="Acme")
         store.save_candidate(self.db, candidate)
@@ -236,3 +288,5 @@ class MissionEngineTests(unittest.TestCase):
         engine.browser = RobotsBrowser(); store.save_task(self.db, __import__("scout.models", fromlist=["ResearchTask"]).ResearchTask(mission_id=mission.id, entity_id=entity.id, task_type="FETCH_PAGE", max_attempts=1, payload={"url": "https://acme.test", "candidate_id": candidate.id}))
         engine.run(mission.id)
         self.assertIn("PAGE_SKIPPED_POLICY", [event["event"] for event in store.mission_events(self.db, mission.id)])
+        fetch = next(item for item in store.tasks_for_mission(self.db, mission.id) if item.task_type == "FETCH_PAGE")
+        self.assertEqual("SKIPPED", fetch.status); self.assertEqual(1, fetch.attempts)

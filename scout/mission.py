@@ -10,7 +10,7 @@ import random
 import threading
 
 from . import store
-from .models import Candidate, Mission, ResearchTask, SourceFact, SourceObservation, BusinessProfile, VerificationResult, OpportunityFinding
+from .models import Candidate, Mission, ResearchTask, SourceFact, SourceObservation, BusinessProfile, VerificationResult, OpportunityFinding, TARGET_PROFILES
 from . import alcatrax_knowledge as brain, brief as brief_mod, intelligence
 from .taxonomy import business_types_for, normalize_industries
 from .providers.search_errors import SearchProviderError, TransientSearchError
@@ -37,6 +37,10 @@ class HTTPTaskError(RuntimeError):
         self.transient = status_code in (408, 429, 500, 502, 503, 504)
 
 
+class PolicySkipped(RuntimeError):
+    """A public-web policy prevented the fetch; this is not a task failure."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -46,7 +50,9 @@ def plan_queries(mission: Mission, completed_queries: set[str] | None = None) ->
     completed_queries = completed_queries or set()
     rows = []
     for industry in normalize_industries(mission.industries):
-        for business_type in business_types_for([industry]):
+        for business_type in mission.business_types or business_types_for([industry]):
+            if business_type not in business_types_for([industry]):
+                continue
             query = " ".join(part for part in (business_type, mission.geographic_scope) if part).strip()
             if query.lower() not in {value.lower() for value in completed_queries}:
                 rows.append((industry, query))
@@ -86,11 +92,19 @@ class ScoutMissionEngine:
         self.politeness = politeness or DomainPoliteness()
         self._persist_lock = threading.Lock()
 
-    def create(self, objective: str, location: str = "", industries: list[str] | None = None, **limits) -> Mission:
+    def create(self, objective: str, location: str = "", industries: list[str] | None = None,
+               business_types: list[str] | None = None, target_profile: str = "local_sme", **limits) -> Mission:
         selected = normalize_industries(industries)
         self._validate_limits(limits)
+        if target_profile not in TARGET_PROFILES:
+            raise ValueError(f"target_profile must be one of: {', '.join(TARGET_PROFILES)}")
+        allowed_types = business_types_for(selected)
+        selected_types = list(dict.fromkeys(business_types or allowed_types))
+        unknown_types = [item for item in selected_types if item not in allowed_types]
+        if not selected_types or unknown_types:
+            raise ValueError("business_types must be non-empty and belong to the selected industries")
         mission = Mission(objective=objective, geographic_scope=location, industries=selected,
-                          business_types=business_types_for(selected), **limits)
+                          business_types=selected_types, target_profile=target_profile, **limits)
         store.save_mission(self.db_path, mission)
         store.log_mission_event(self.db_path, mission.id, "MISSION_CREATED", {"objective": objective})
         for industry, query in plan_queries(mission):
@@ -167,6 +181,9 @@ class ScoutMissionEngine:
             elif task.task_type == "EVALUATE_ENTITY": self._evaluate_task(mission, task)
             else: task.result_summary = {"skipped": "not needed in deterministic pass"}
             task.status, task.completed_at, task.error = "COMPLETED", _now(), ""
+        except PolicySkipped as error:
+            task.status, task.completed_at, task.error = "SKIPPED", _now(), str(error)
+            task.result_summary = {"skipped_policy": str(error)}
         except HTTPTaskError as error:
             task.error = str(error)
             retry = error.transient and task.attempts < task.max_attempts
@@ -210,18 +227,26 @@ class ScoutMissionEngine:
             domain = store.normalize_domain(hit.url)
             if not domain or domain in seen: self._count(mission, "duplicates_skipped"); continue
             seen.add(domain)
+            candidate = Candidate(name=hit.title or domain, source="mission_search", source_url=hit.url, query=task.payload["query"])
+            store.save_candidate(self.db_path, candidate)
+            profile_reason = self._search_profile_reason(mission, candidate)
+            if profile_reason:
+                candidate.campaign_status, candidate.campaign_reason = "out_of_profile", profile_reason
+                store.save_candidate(self.db_path, candidate)
+                self._count(mission, "out_of_profile")
+                store.log_mission_event(self.db_path, mission.id, "CANDIDATE_OUT_OF_PROFILE", {"candidate_id": candidate.id, "reason": profile_reason})
+                continue
             existing = store.find_entity_by_domain(self.db_path, domain)
             if existing:
                 latest = store.latest_observation_for_entity(self.db_path, existing.id)
                 if latest and not latest.get("error") and (latest.get("status_code") or 0) < 400 and self._fresh(latest.get("fetched_at", ""), mission.freshness_seconds):
                     self._count(mission, "duplicates_skipped"); self._count(mission, "recent_entities_skipped"); continue
-                candidate = Candidate(name=hit.title or domain, source="mission_search", source_url=hit.url, query=task.payload["query"])
                 store.save_candidate(self.db_path, candidate); store.link_candidate_to_entity(self.db_path, candidate, existing.id)
                 store.save_task(self.db_path, ResearchTask(mission_id=mission.id, entity_id=existing.id, parent_task_id=task.id, task_type="REVISIT_ENTITY", priority=58, payload={"url": hit.url, "candidate_id": candidate.id}))
                 self._count(mission, "stale_entities_revisited"); continue
             if mission.counters.get("unique_entities", 0) >= mission.max_entities:
                 break
-            candidate = Candidate(name=hit.title or domain, source="mission_search", source_url=hit.url, query=task.payload["query"])
+            candidate.campaign_status = "eligible"
             store.save_candidate(self.db_path, candidate)
             entity = store.resolve_entity(self.db_path, candidate.name, hit.url, mission.geographic_scope, industry=task.payload["industry"])
             store.link_candidate_to_entity(self.db_path, candidate, entity.id)
@@ -229,6 +254,18 @@ class ScoutMissionEngine:
                                                         task_type="INVESTIGATE_ENTITY", priority=60, payload={"url": hit.url, "candidate_id": candidate.id}))
             self._count(mission, "unique_entities"); store.log_mission_event(self.db_path, mission.id, "ENTITY_DISCOVERED", {"entity_id": entity.id})
         task.result_summary = {"hits": len(hits)}; store.log_mission_event(self.db_path, mission.id, "SEARCH_COMPLETED", task.result_summary)
+
+    @staticmethod
+    def _search_profile_reason(mission: Mission, candidate: Candidate) -> str:
+        """Only campaign-local fit decisions; no business is globally excluded."""
+        if mission.target_profile == "unknown":
+            return "insufficient public evidence to select a campaign profile"
+        if mission.target_profile != "local_sme":
+            return ""
+        identity = f"{candidate.name} {store.normalize_domain(candidate.source_url)}".lower()
+        # These are explicit public identity signals, not a size inference from a weak website.
+        signals = ("carrefour", " franchise", " retail chain", " multinational")
+        return "confirmed enterprise/chain identity signal for local_sme campaign" if any(signal in identity for signal in signals) else ""
 
     def _investigate_task(self, mission: Mission, task: ResearchTask) -> None:
         entity = store.get_entity(self.db_path, task.entity_id)
@@ -251,9 +288,10 @@ class ScoutMissionEngine:
         observation.facts = [SourceFact("title", result.title or "", result.url, (result.title or "")[:200], confidence="observed")]
         store.save_source_observation(self.db_path, observation); self._count(mission, "pages_fetched")
         if result.error:
-            self._count(mission, "fetch_failures")
             if result.error.startswith("ROBOTS_"):
                 store.log_mission_event(self.db_path, mission.id, "PAGE_SKIPPED_POLICY", {"url": url, "policy": result.error})
+                raise PolicySkipped(result.error)
+            self._count(mission, "fetch_failures")
             raise RuntimeError(result.error)
         if result.status_code and result.status_code >= 400:
             self._count(mission, "fetch_failures"); raise HTTPTaskError(result.status_code)
@@ -312,6 +350,26 @@ class ScoutMissionEngine:
         candidate = Candidate(**next(item for item in store.candidates_for_entity(self.db_path, task.entity_id) if item["id"] == candidate_id))
         profile = BusinessProfile(candidate_id=candidate.id, business_name=entity.canonical_name, what_they_sell="", target_customers="", location=entity.location, contact_channels=[], has_ecommerce=ecommerce, extracted_from=[item["source_url"] for item in usable], confidence_note="Deterministic mission reconnaissance.")
         verification = VerificationResult(candidate_id=candidate.id, sources_checked=profile.extracted_from)
+        contact_observed = any(meta.get("phone_numbers") or meta.get("emails") or meta.get("has_whatsapp_link") for meta in metadata)
+        substantive = [finding for finding in findings if finding.category != "possible_seo_structure_opportunity"]
+        operations_terms = ("inventory", "stock", "workflow", "report", "dashboard", "booking", "appointment")
+        operations_need = any(term in text for term in operations_terms)
+        reason = ""
+        if not contact_observed:
+            reason = "no public business contact channel observed"
+        elif not substantive:
+            reason = "no specific observable digital gap beyond SEO metadata"
+        elif mission.target_profile == "corporate_operations" and not operations_need:
+            reason = "no public inventory, workflow, reporting, booking, or operations-system need observed"
+        if reason:
+            brief = brief_mod.build_brief(candidate, profile, verification, [])
+            brief.status = "out_of_profile"
+            store.save_brief(self.db_path, brief)
+            self._count(mission, "out_of_profile")
+            task.result_summary = {"state": "out_of_profile", "reason": reason}
+            store.log_mission_event(self.db_path, mission.id, "ENTITY_OUT_OF_PROFILE", {"entity_id": entity.id, "reason": reason})
+            return
+        findings = substantive
         brief = brief_mod.build_brief(candidate, profile, verification, findings); store.save_brief(self.db_path, brief)
         self._count(mission, "opportunities_found", len(findings)); task.result_summary = {"state": "evaluated", "findings": len(findings)}
         store.log_mission_event(self.db_path, mission.id, "ENTITY_EVALUATED", task.result_summary)
@@ -331,7 +389,7 @@ class ScoutMissionEngine:
         candidate_ids = {task.payload.get("candidate_id") for task in tasks if task.payload.get("candidate_id")}
         all_observations = [item for candidate_id in candidate_ids for item in store.get_source_observations(self.db_path, candidate_id)]
         latest_observations = [item for candidate_id in candidate_ids for item in store.latest_source_observations(self.db_path, candidate_id)]
-        limits = f"Workers: {mission.worker_count} (bounded 1–8)\\n\\nRetries per task: {mission.max_retries}\\n\\nFreshness window: {mission.freshness_seconds} seconds\\n\\nTime budget: {mission.time_budget_seconds or 'none'} seconds\\n\\nSearch limit: {mission.max_searches}\\n\\nEntity limit: {mission.max_entities}\\n\\nPages per entity: {mission.max_pages_per_entity}\\n\\nTotal page limit: {mission.max_total_pages}"
+        limits = f"Workers: {mission.worker_count} (bounded 1–8)\\n\\nRetries per task: {mission.max_retries}\\n\\nFreshness window: {mission.freshness_seconds} seconds\\n\\nTime budget: {mission.time_budget_seconds or 'none'} seconds\\n\\nSearch limit: {mission.max_searches}\\n\\nEntity limit: {mission.max_entities}\\n\\nPages per entity: {mission.max_pages_per_entity}\\n\\nTotal page limit: {mission.max_total_pages}\\n\\nTarget profile: {mission.target_profile}"
         def failure_line(task: ResearchTask) -> str:
             diagnostics = task.result_summary.get("failure_diagnostics", [])
             if not diagnostics:

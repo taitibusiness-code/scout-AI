@@ -49,6 +49,8 @@ def rank_opportunities(db_path: str, entity_ids: list[str] | None = None) -> lis
     briefs = _latest_briefs_by_entity(store.briefs_for_entities(db_path, entity_ids))
     ranked: list[dict] = []
     for brief in briefs:
+        if brief.get("status") == "out_of_profile":
+            continue
         for opportunity in brief.get("opportunities", []):
             reasons, score = [], 0
             confidence = opportunity.get("confidence", "unknown")
